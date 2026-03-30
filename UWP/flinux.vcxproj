@@ -75,6 +75,7 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
   </ImportGroup>
   <ImportGroup Label="Shared">
   </ImportGroup>
@@ -320,6 +321,7 @@
     <ClInclude Include="src\onecore_types.h" />
     <ClInclude Include="src\platform.h" />
     <ClInclude Include="src\platform\arm\context.h" />
+    <ClInclude Include="src\platform\x64\context.h" />
     <ClInclude Include="src\platform\x86\context.h" />
     <ClInclude Include="src\shared.h" />
     <ClInclude Include="src\str.h" />
@@ -385,6 +387,7 @@
     <ClCompile Include="src\syscall\process.c" />
     <ClCompile Include="src\syscall\sig.c" />
     <ClCompile Include="src\syscall\syscall.c" />
+    <ClCompile Include="src\syscall\syscall_dispatch.c" />
     <ClCompile Include="src\syscall\timer.c" />
     <ClCompile Include="src\syscall\tls.c" />
     <ClCompile Include="src\syscall\vfs.c" />
@@ -393,7 +396,16 @@
     <ClCompile Include="src\wcwidth.c" />
     <ClCompile Include="src\win7compat.c" />
   </ItemGroup>
+  <ItemGroup>
+    <MASM Include="src\syscall\stubs64.asm">
+      <ExcludedFromBuild Condition="'$(Platform)'!='x64'">true</ExcludedFromBuild>
+    </MASM>
+    <MASM Include="src\syscall\stubs.asm">
+      <ExcludedFromBuild Condition="'$(Platform)'!='Win32'">true</ExcludedFromBuild>
+    </MASM>
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
   </ImportGroup>
 </Project>

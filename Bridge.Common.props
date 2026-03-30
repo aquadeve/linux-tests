@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Bridge.Common.props
+  Common property definitions for the FLinux UWP bridge project.
+  This file defines shared toolset and platform version properties used
+  across all build configurations.
+-->
+<Project ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="BridgeCommon">
+    <!-- Platform toolset: v143 = VS 2022, v142 = VS 2019, v141 = VS 2017 -->
+    <BridgePlatformToolset>v143</BridgePlatformToolset>
+    <!-- Minimum supported Windows 10 version (Threshold 1, build 10240) -->
+    <BridgeWindowsTargetPlatformMinVersion>10.0.10240.0</BridgeWindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+</Project>
