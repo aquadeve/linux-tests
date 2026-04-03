@@ -147,48 +147,6 @@ namespace LinuxBinaryTranslator.Syscall
         public const int SYS_getrandom = 318;
         public const int SYS_getdents64 = 217;
         public const int SYS_readlinkat = 267;
-        public const int SYS_getrusage = 98;
-        public const int SYS_times = 100;
-        public const int SYS_madvise = 28;
-        public const int SYS_poll = 7;
-        public const int SYS_select = 23;
-        public const int SYS_futex = 202;
-        public const int SYS_clock_nanosleep = 230;
-        public const int SYS_flock = 73;
-        public const int SYS_fsync = 74;
-        public const int SYS_fdatasync = 75;
-        public const int SYS_truncate = 76;
-        public const int SYS_ftruncate = 77;
-        public const int SYS_readlink = 89;
-        public const int SYS_mkdir = 83;
-        public const int SYS_rmdir = 84;
-        public const int SYS_unlink = 87;
-        public const int SYS_rename = 82;
-        public const int SYS_creat = 85;
-        public const int SYS_link = 86;
-        public const int SYS_symlink = 88;
-        public const int SYS_chmod = 90;
-        public const int SYS_fchmod = 91;
-        public const int SYS_chown = 92;
-        public const int SYS_fchown = 93;
-        public const int SYS_lchown = 94;
-        public const int SYS_getgroups = 115;
-        public const int SYS_setgroups = 116;
-        public const int SYS_syslog = 103;
-        public const int SYS_getitimer = 36;
-        public const int SYS_alarm = 37;
-        public const int SYS_setitimer = 38;
-        public const int SYS_pause = 34;
-        public const int SYS_rt_sigreturn = 15;
-        public const int SYS_pread64 = 17;
-        public const int SYS_pwrite64 = 18;
-        public const int SYS_mincore = 27;
-        public const int SYS_mremap = 25;
-        public const int SYS_msync = 26;
-        public const int SYS_mkdirat = 258;
-        public const int SYS_unlinkat = 263;
-        public const int SYS_renameat = 264;
-        public const int SYS_fchdir = 81;
     }
 
     /// <summary>
@@ -374,7 +332,7 @@ namespace LinuxBinaryTranslator.Syscall
         {
             if (count == 0) return 0;
             byte[] data = _vfs.Read(fd, (int)Math.Min(count, int.MaxValue));
-            if (data.Length < 0) return data.Length; // Error
+            if (data.Length == 0) return 0;
             _memory.Write(bufAddr, data);
             return data.Length;
         }
