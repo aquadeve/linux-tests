@@ -87,6 +87,9 @@ namespace LinuxBinaryTranslator
 
         /// <summary>
         /// Load an ELF binary into memory and prepare it for execution.
+        /// If the binary requires a dynamic linker (PT_INTERP), the interpreter
+        /// is loaded from the rootfs and execution starts at the interpreter's
+        /// entry point instead of the binary's.
         /// </summary>
         public ElfLoadResult LoadBinary(byte[] elfData, string[]? argv = null, string[]? envp = null)
         {
@@ -96,7 +99,52 @@ namespace LinuxBinaryTranslator
             _logger($"ELF loaded: entry=0x{loadResult.EntryPoint:X16}, " +
                     $"base=0x{loadResult.BaseAddress:X16}, " +
                     $"brk=0x{loadResult.BrkAddress:X16}, " +
-                    $"segments={loadResult.Segments.Count}");
+                    $"segments={loadResult.Segments.Count}" +
+                    (loadResult.InterpreterPath != null ? $", interp={loadResult.InterpreterPath}" : ""));
+
+            // If the binary needs a dynamic linker, load it
+            ulong interpBase = 0;
+            if (loadResult.InterpreterPath != null)
+            {
+                byte[]? interpData = _vfs.ReadFileBytes(loadResult.InterpreterPath);
+                if (interpData != null)
+                {
+                    // Load interpreter above the main binary
+                    ulong interpLoadAddr = ((loadResult.BrkAddress + 0x100000UL) & ~0xFFFUL);
+                    var interpResult = loader.LoadInterpreter(interpData, interpLoadAddr);
+                    interpBase = interpResult.InterpreterBase;
+
+                    _logger($"Interpreter loaded: entry=0x{interpResult.EntryPoint:X16}, " +
+                            $"base=0x{interpBase:X16}");
+
+                    // Execution starts at the interpreter's entry point
+                    // The interpreter will then jump to the main binary's entry
+                    loadResult.InterpreterBase = interpBase;
+
+                    // Update brk to be above both binaries
+                    if (interpResult.BrkAddress > loadResult.BrkAddress)
+                        loadResult.BrkAddress = interpResult.BrkAddress;
+
+                    // Save the real entry point — the interpreter needs it via AT_ENTRY
+                    ulong realEntry = loadResult.EntryPoint;
+                    loadResult.EntryPoint = interpResult.EntryPoint;
+
+                    // Initialize the program break
+                    _memory.InitializeBrk(loadResult.BrkAddress);
+
+                    // Set up the stack with AT_BASE pointing to interpreter
+                    SetupStackWithInterpreter(loadResult, realEntry, interpBase,
+                        argv ?? new[] { "program" }, envp ?? GetDefaultEnvironment());
+
+                    _cpu.RIP = loadResult.EntryPoint;
+                    return loadResult;
+                }
+                else
+                {
+                    _logger($"Warning: interpreter not found: {loadResult.InterpreterPath}, " +
+                            "attempting direct execution");
+                }
+            }
 
             // Initialize the program break
             _memory.InitializeBrk(loadResult.BrkAddress);
@@ -405,6 +453,112 @@ namespace LinuxBinaryTranslator
             }
 
             _logger($"Stack set up: RSP=0x{_cpu.RSP:X16}, argc={argv.Length}");
+        }
+
+        /// <summary>
+        /// Set up the stack for a dynamically-linked binary with an interpreter.
+        /// The key difference from SetupStack is that AT_ENTRY points to the
+        /// original binary's entry point (not the interpreter's), and AT_BASE
+        /// points to the interpreter's load base address.
+        /// </summary>
+        private void SetupStackWithInterpreter(ElfLoadResult loadResult, ulong realEntry,
+                                                ulong interpBase, string[] argv, string[] envp)
+        {
+            ulong stackTop = StackBase;
+            ulong stackBottom = stackTop - StackSize;
+
+            _memory.Map(stackBottom, StackSize, MemoryProtection.ReadWrite);
+
+            ulong sp = stackTop;
+
+            ulong[] argvPtrs = new ulong[argv.Length];
+            for (int i = 0; i < argv.Length; i++)
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes(argv[i] + "\0");
+                sp -= (ulong)bytes.Length;
+                _memory.Write(sp, bytes);
+                argvPtrs[i] = sp;
+            }
+
+            ulong[] envpPtrs = new ulong[envp.Length];
+            for (int i = 0; i < envp.Length; i++)
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes(envp[i] + "\0");
+                sp -= (ulong)bytes.Length;
+                _memory.Write(sp, bytes);
+                envpPtrs[i] = sp;
+            }
+
+            sp -= 16;
+            ulong randomAddr = sp;
+            var rng = new Random();
+            byte[] randomBytes = new byte[16];
+            rng.NextBytes(randomBytes);
+            _memory.Write(randomAddr, randomBytes);
+
+            byte[] platformStr = Encoding.UTF8.GetBytes("x86_64\0");
+            sp -= (ulong)platformStr.Length;
+            ulong platformAddr = sp;
+            _memory.Write(platformAddr, platformStr);
+
+            sp &= ~0xFUL;
+
+            // Auxiliary vector — AT_ENTRY is the real binary entry, AT_BASE is interpreter base
+            var auxv = new (ulong type, ulong value)[]
+            {
+                (ElfConstants.AT_PHDR, loadResult.ProgramHeaderAddress),
+                (ElfConstants.AT_PHENT, loadResult.ProgramHeaderEntrySize),
+                (ElfConstants.AT_PHNUM, loadResult.ProgramHeaderCount),
+                (ElfConstants.AT_PAGESZ, 4096),
+                (ElfConstants.AT_BASE, interpBase),
+                (ElfConstants.AT_FLAGS, 0),
+                (ElfConstants.AT_ENTRY, realEntry),
+                (ElfConstants.AT_UID, 1000),
+                (ElfConstants.AT_EUID, 1000),
+                (ElfConstants.AT_GID, 1000),
+                (ElfConstants.AT_EGID, 1000),
+                (ElfConstants.AT_CLKTCK, 100),
+                (ElfConstants.AT_PLATFORM, platformAddr),
+                (ElfConstants.AT_RANDOM, randomAddr),
+                (ElfConstants.AT_NULL, 0),
+            };
+
+            int totalEntries = 1 + argv.Length + 1 + envp.Length + 1 + (auxv.Length * 2);
+            sp -= (ulong)(totalEntries * 8);
+            sp &= ~0xFUL;
+
+            _cpu.RSP = sp;
+            ulong ptr = sp;
+
+            _memory.WriteUInt64(ptr, (ulong)argv.Length);
+            ptr += 8;
+
+            for (int i = 0; i < argvPtrs.Length; i++)
+            {
+                _memory.WriteUInt64(ptr, argvPtrs[i]);
+                ptr += 8;
+            }
+            _memory.WriteUInt64(ptr, 0);
+            ptr += 8;
+
+            for (int i = 0; i < envpPtrs.Length; i++)
+            {
+                _memory.WriteUInt64(ptr, envpPtrs[i]);
+                ptr += 8;
+            }
+            _memory.WriteUInt64(ptr, 0);
+            ptr += 8;
+
+            foreach (var (type, value) in auxv)
+            {
+                _memory.WriteUInt64(ptr, type);
+                ptr += 8;
+                _memory.WriteUInt64(ptr, value);
+                ptr += 8;
+            }
+
+            _logger($"Stack set up (with interp): RSP=0x{_cpu.RSP:X16}, " +
+                    $"argc={argv.Length}, AT_ENTRY=0x{realEntry:X16}, AT_BASE=0x{interpBase:X16}");
         }
 
         private static string[] GetDefaultEnvironment()

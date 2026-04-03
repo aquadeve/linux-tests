@@ -48,6 +48,8 @@ namespace LinuxBinaryTranslator.Elf
         public ulong BrkAddress { get; set; }
         public ushort Machine { get; set; }
         public List<LoadedSegment> Segments { get; } = new List<LoadedSegment>();
+        public string? InterpreterPath { get; set; }
+        public ulong InterpreterBase { get; set; }
     }
 
     /// <summary>
@@ -86,6 +88,20 @@ namespace LinuxBinaryTranslator.Elf
 
             ulong lowestAddr = ulong.MaxValue;
             ulong highestAddr = 0;
+
+            // Extract PT_INTERP (dynamic linker path) if present
+            foreach (var phdr in programHeaders)
+            {
+                if (phdr.p_type == ElfConstants.PT_INTERP && phdr.p_filesz > 0)
+                {
+                    int interpLen = (int)Math.Min(phdr.p_filesz, 256) - 1; // -1 for null terminator
+                    if (interpLen > 0 && phdr.p_offset + phdr.p_filesz <= (ulong)elfData.Length)
+                    {
+                        result.InterpreterPath = System.Text.Encoding.UTF8.GetString(
+                            elfData, (int)phdr.p_offset, interpLen).TrimEnd('\0');
+                    }
+                }
+            }
 
             // Load all PT_LOAD segments into virtual memory
             foreach (var phdr in programHeaders)
@@ -142,6 +158,89 @@ namespace LinuxBinaryTranslator.Elf
             {
                 ulong phdrSize = (ulong)(header.e_phentsize * header.e_phnum);
                 // Program headers may already be in a loaded segment
+                result.ProgramHeaderAddress = result.BaseAddress + header.e_phoff;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Load the ELF interpreter (dynamic linker, e.g., /lib64/ld-linux-x86-64.so.2)
+        /// at a base address above the main binary. The interpreter is loaded as a
+        /// position-independent binary with a base offset applied to all addresses.
+        /// </summary>
+        public ElfLoadResult LoadInterpreter(byte[] interpData, ulong baseAddress)
+        {
+            if (interpData == null || interpData.Length < 64)
+                throw new ElfLoadException("Interpreter data too small");
+
+            var header = ParseHeader(interpData);
+            ValidateHeader(header);
+
+            var programHeaders = ParseProgramHeaders(interpData, header);
+            var result = new ElfLoadResult
+            {
+                ProgramHeaderEntrySize = header.e_phentsize,
+                ProgramHeaderCount = header.e_phnum,
+                Machine = header.e_machine,
+            };
+
+            // For ET_DYN (shared objects), apply base address offset
+            ulong baseOffset = header.IsSharedObject() ? baseAddress : 0;
+            result.EntryPoint = header.e_entry + baseOffset;
+            result.InterpreterBase = baseOffset;
+
+            ulong lowestAddr = ulong.MaxValue;
+            ulong highestAddr = 0;
+
+            foreach (var phdr in programHeaders)
+            {
+                if (!phdr.IsLoadable || phdr.p_memsz == 0)
+                    continue;
+
+                ulong loadAddr = phdr.p_vaddr + baseOffset;
+                ulong alignedAddr = AlignDown(loadAddr, PageSize);
+                ulong alignedEnd = AlignUp(loadAddr + phdr.p_memsz, PageSize);
+                ulong regionSize = alignedEnd - alignedAddr;
+
+                if (alignedAddr < lowestAddr)
+                    lowestAddr = alignedAddr;
+                if (alignedEnd > highestAddr)
+                    highestAddr = alignedEnd;
+
+                var protection = MemoryProtection.None;
+                if (phdr.IsReadable) protection |= MemoryProtection.Read;
+                if (phdr.IsWritable) protection |= MemoryProtection.Write;
+                if (phdr.IsExecutable) protection |= MemoryProtection.Execute;
+
+                _memory.Map(alignedAddr, regionSize, protection);
+
+                if (phdr.p_filesz > 0)
+                {
+                    ulong fileOffset = phdr.p_offset;
+                    ulong copyLen = Math.Min(phdr.p_filesz, (ulong)interpData.Length - fileOffset);
+                    var segment = new byte[copyLen];
+                    Array.Copy(interpData, (long)fileOffset, segment, 0, (long)copyLen);
+                    _memory.Write(loadAddr, segment);
+                }
+
+                if (phdr.p_memsz > phdr.p_filesz)
+                {
+                    ulong bssStart = loadAddr + phdr.p_filesz;
+                    ulong bssSize = phdr.p_memsz - phdr.p_filesz;
+                    _memory.Zero(bssStart, bssSize);
+                }
+
+                result.Segments.Add(new LoadedSegment(
+                    loadAddr, phdr.p_memsz, phdr.p_filesz,
+                    phdr.IsReadable, phdr.IsWritable, phdr.IsExecutable));
+            }
+
+            result.BaseAddress = lowestAddr == ulong.MaxValue ? baseAddress : lowestAddr;
+            result.BrkAddress = highestAddr;
+
+            if (header.e_phoff > 0 && header.e_phnum > 0)
+            {
                 result.ProgramHeaderAddress = result.BaseAddress + header.e_phoff;
             }
 
