@@ -145,6 +145,50 @@ namespace LinuxBinaryTranslator.Syscall
         public const int SYS_dup3 = 292;
         public const int SYS_prlimit64 = 302;
         public const int SYS_getrandom = 318;
+        public const int SYS_getdents64 = 217;
+        public const int SYS_readlinkat = 267;
+        public const int SYS_getrusage = 98;
+        public const int SYS_times = 100;
+        public const int SYS_madvise = 28;
+        public const int SYS_poll = 7;
+        public const int SYS_select = 23;
+        public const int SYS_futex = 202;
+        public const int SYS_clock_nanosleep = 230;
+        public const int SYS_flock = 73;
+        public const int SYS_fsync = 74;
+        public const int SYS_fdatasync = 75;
+        public const int SYS_truncate = 76;
+        public const int SYS_ftruncate = 77;
+        public const int SYS_readlink = 89;
+        public const int SYS_mkdir = 83;
+        public const int SYS_rmdir = 84;
+        public const int SYS_unlink = 87;
+        public const int SYS_rename = 82;
+        public const int SYS_creat = 85;
+        public const int SYS_link = 86;
+        public const int SYS_symlink = 88;
+        public const int SYS_chmod = 90;
+        public const int SYS_fchmod = 91;
+        public const int SYS_chown = 92;
+        public const int SYS_fchown = 93;
+        public const int SYS_lchown = 94;
+        public const int SYS_getgroups = 115;
+        public const int SYS_setgroups = 116;
+        public const int SYS_syslog = 103;
+        public const int SYS_getitimer = 36;
+        public const int SYS_alarm = 37;
+        public const int SYS_setitimer = 38;
+        public const int SYS_pause = 34;
+        public const int SYS_rt_sigreturn = 15;
+        public const int SYS_pread64 = 17;
+        public const int SYS_pwrite64 = 18;
+        public const int SYS_mincore = 27;
+        public const int SYS_mremap = 25;
+        public const int SYS_msync = 26;
+        public const int SYS_mkdirat = 258;
+        public const int SYS_unlinkat = 263;
+        public const int SYS_renameat = 264;
+        public const int SYS_fchdir = 81;
     }
 
     /// <summary>
@@ -269,6 +313,49 @@ namespace LinuxBinaryTranslator.Syscall
                     SyscallNumber.SYS_exit_group => SysExit(state, (int)arg1),
                     SyscallNumber.SYS_kill => 0, // Stub
                     SyscallNumber.SYS_tgkill => 0, // Stub
+                    SyscallNumber.SYS_getdents64 => SysGetdents64((int)arg1, arg2, (int)arg3),
+                    SyscallNumber.SYS_readlink => SysReadlink(arg1, arg2, arg3),
+                    SyscallNumber.SYS_readlinkat => SysReadlinkat((int)arg1, arg2, arg3, arg4),
+                    SyscallNumber.SYS_poll => SysPoll(arg1, (int)arg2, (int)arg3),
+                    SyscallNumber.SYS_select => 0, // Stub: simple select
+                    SyscallNumber.SYS_futex => SysFutex(arg1, (int)arg2, (uint)arg3, arg4, arg5, (uint)arg6),
+                    SyscallNumber.SYS_madvise => 0, // Advisory only — always succeed
+                    SyscallNumber.SYS_mincore => -Errno.ENOSYS,
+                    SyscallNumber.SYS_msync => 0,
+                    SyscallNumber.SYS_mremap => -Errno.ENOSYS,
+                    SyscallNumber.SYS_getrusage => SysGetrusage((int)arg1, arg2),
+                    SyscallNumber.SYS_times => SysTimes(arg1),
+                    SyscallNumber.SYS_clock_nanosleep => SysClockNanosleep((int)arg1, (int)arg2, arg3, arg4),
+                    SyscallNumber.SYS_flock => 0, // File locking — always succeed
+                    SyscallNumber.SYS_fsync => 0,
+                    SyscallNumber.SYS_fdatasync => 0,
+                    SyscallNumber.SYS_truncate => -Errno.EROFS,
+                    SyscallNumber.SYS_ftruncate => -Errno.EROFS,
+                    SyscallNumber.SYS_mkdir => -Errno.EROFS,
+                    SyscallNumber.SYS_rmdir => -Errno.EROFS,
+                    SyscallNumber.SYS_unlink => -Errno.EROFS,
+                    SyscallNumber.SYS_rename => -Errno.EROFS,
+                    SyscallNumber.SYS_creat => SysOpen(arg1, OpenFlags.O_CREAT | OpenFlags.O_WRONLY | OpenFlags.O_TRUNC, (int)arg2),
+                    SyscallNumber.SYS_link => -Errno.EROFS,
+                    SyscallNumber.SYS_symlink => -Errno.EROFS,
+                    SyscallNumber.SYS_chmod => 0,
+                    SyscallNumber.SYS_fchmod => 0,
+                    SyscallNumber.SYS_chown => 0,
+                    SyscallNumber.SYS_fchown => 0,
+                    SyscallNumber.SYS_lchown => 0,
+                    SyscallNumber.SYS_getgroups => 0, // No supplementary groups
+                    SyscallNumber.SYS_setgroups => 0,
+                    SyscallNumber.SYS_syslog => -Errno.EPERM,
+                    SyscallNumber.SYS_getitimer => -Errno.ENOSYS,
+                    SyscallNumber.SYS_alarm => 0, // Alarm — stub
+                    SyscallNumber.SYS_setitimer => -Errno.ENOSYS,
+                    SyscallNumber.SYS_pause => SysPause(),
+                    SyscallNumber.SYS_pread64 => SysPread64((int)arg1, arg2, arg3, (long)arg4),
+                    SyscallNumber.SYS_pwrite64 => SysPwrite64((int)arg1, arg2, arg3, (long)arg4),
+                    SyscallNumber.SYS_mkdirat => -Errno.EROFS,
+                    SyscallNumber.SYS_unlinkat => -Errno.EROFS,
+                    SyscallNumber.SYS_renameat => -Errno.EROFS,
+                    SyscallNumber.SYS_fchdir => 0,
                     _ => HandleUnimplemented((int)syscallNum),
                 };
             }
@@ -720,6 +807,185 @@ namespace LinuxBinaryTranslator.Syscall
         }
 
         // === Helpers ===
+
+        // === New syscall implementations ===
+
+        private long SysGetdents64(int fd, ulong bufAddr, int count)
+        {
+            // getdents64 returns directory entries. For our simple VFS,
+            // return "." and ".." entries for directories, or ENOTDIR for files
+            if (fd < 0) return -Errno.EBADF;
+            // Simplified: return 0 (end of directory) since our VFS
+            // doesn't support real directory listing
+            return 0;
+        }
+
+        private long SysReadlink(ulong pathAddr, ulong bufAddr, ulong bufSize)
+        {
+            string path = ReadString(pathAddr);
+            return DoReadlink(ResolvePath(path), bufAddr, bufSize);
+        }
+
+        private long SysReadlinkat(int dirfd, ulong pathAddr, ulong bufAddr, ulong bufSize)
+        {
+            string path = ReadString(pathAddr);
+            if (path.Length > 0 && path[0] != '/' && dirfd == OpenFlags.AT_FDCWD)
+                path = _cwd + "/" + path;
+            return DoReadlink(path, bufAddr, bufSize);
+        }
+
+        private long DoReadlink(string path, ulong bufAddr, ulong bufSize)
+        {
+            // Handle /proc/self/exe — programs often readlink this
+            if (path == "/proc/self/exe")
+            {
+                string target = "/usr/bin/program";
+                byte[] data = Encoding.UTF8.GetBytes(target);
+                int len = (int)Math.Min((ulong)data.Length, bufSize);
+                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                return len;
+            }
+            // Handle /proc/self/fd/N
+            if (path.StartsWith("/proc/self/fd/"))
+            {
+                string target = "/dev/fd/" + path.Substring(14);
+                byte[] data = Encoding.UTF8.GetBytes(target);
+                int len = (int)Math.Min((ulong)data.Length, bufSize);
+                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                return len;
+            }
+            return -Errno.EINVAL;
+        }
+
+        private long SysPoll(ulong fdsAddr, int nfds, int timeout)
+        {
+            // poll() — simplified implementation for stdin readiness
+            // struct pollfd { int fd; short events; short revents; }
+            int ready = 0;
+            for (int i = 0; i < nfds; i++)
+            {
+                ulong entry = fdsAddr + (ulong)(i * 8);
+                int fd = (int)_memory.ReadUInt32(entry);
+                short events = (short)_memory.ReadUInt16(entry + 4);
+                short revents = 0;
+
+                // Check if fd is valid
+                if (_vfs.Fstat(fd) != null)
+                {
+                    // POLLIN = 1, POLLOUT = 4
+                    if ((events & 1) != 0) revents |= 1;    // Readable
+                    if ((events & 4) != 0) revents |= 4;    // Writable
+                    if (revents != 0) ready++;
+                }
+                else
+                {
+                    revents = 0x20; // POLLNVAL
+                }
+
+                _memory.WriteUInt16(entry + 6, (ushort)revents);
+            }
+
+            if (timeout > 0)
+                System.Threading.Tasks.Task.Delay(Math.Min(timeout, 100)).Wait();
+
+            return ready;
+        }
+
+        private long SysFutex(ulong uaddr, int futexOp, uint val, ulong timeout, ulong uaddr2, uint val3)
+        {
+            // futex() — basic implementation for single-threaded use
+            const int FUTEX_WAIT = 0;
+            const int FUTEX_WAKE = 1;
+            const int FUTEX_PRIVATE_FLAG = 128;
+
+            int op = futexOp & ~FUTEX_PRIVATE_FLAG;
+
+            switch (op)
+            {
+                case FUTEX_WAIT:
+                {
+                    // Check if *uaddr == val; if so, sleep; if not, return EAGAIN
+                    uint current = _memory.ReadUInt32(uaddr);
+                    if (current != val)
+                        return -Errno.EAGAIN;
+                    // For single-threaded: just yield and return
+                    System.Threading.Thread.Yield();
+                    return 0;
+                }
+                case FUTEX_WAKE:
+                    // Wake up to 'val' waiters — in single-threaded mode, return 0
+                    return 0;
+                default:
+                    return -Errno.ENOSYS;
+            }
+        }
+
+        private long SysGetrusage(int who, ulong usageAddr)
+        {
+            // struct rusage — zero-fill for minimal implementation
+            // Total size: 144 bytes on x86_64
+            _memory.Zero(usageAddr, 144);
+            return 0;
+        }
+
+        private long SysTimes(ulong bufAddr)
+        {
+            // struct tms { clock_t tms_utime, tms_stime, tms_cutime, tms_cstime; }
+            if (bufAddr != 0)
+            {
+                long ticks = Environment.TickCount;
+                _memory.WriteUInt64(bufAddr, (ulong)ticks);      // tms_utime
+                _memory.WriteUInt64(bufAddr + 8, 0);             // tms_stime
+                _memory.WriteUInt64(bufAddr + 16, 0);            // tms_cutime
+                _memory.WriteUInt64(bufAddr + 24, 0);            // tms_cstime
+            }
+            return Environment.TickCount;
+        }
+
+        private long SysClockNanosleep(int clockId, int flags, ulong reqAddr, ulong remAddr)
+        {
+            long sec = (long)_memory.ReadUInt64(reqAddr);
+            long nsec = (long)_memory.ReadUInt64(reqAddr + 8);
+            int ms = (int)(sec * 1000 + nsec / 1000000);
+            if (ms > 0)
+                System.Threading.Tasks.Task.Delay(ms).Wait();
+            if (remAddr != 0)
+            {
+                _memory.WriteUInt64(remAddr, 0);
+                _memory.WriteUInt64(remAddr + 8, 0);
+            }
+            return 0;
+        }
+
+        private long SysPause()
+        {
+            // pause() — wait for signal delivery (simplified: sleep briefly then return EINTR)
+            System.Threading.Tasks.Task.Delay(100).Wait();
+            return -Errno.EINTR;
+        }
+
+        private long SysPread64(int fd, ulong bufAddr, ulong count, long offset)
+        {
+            // pread64 — read at offset without changing file position
+            long savedPos = _vfs.Lseek(fd, 0, SeekWhence.SEEK_CUR);
+            _vfs.Lseek(fd, offset, SeekWhence.SEEK_SET);
+            byte[] data = _vfs.Read(fd, (int)Math.Min(count, int.MaxValue));
+            _vfs.Lseek(fd, savedPos, SeekWhence.SEEK_SET);
+            if (data.Length > 0)
+                _memory.Write(bufAddr, data);
+            return data.Length;
+        }
+
+        private long SysPwrite64(int fd, ulong bufAddr, ulong count, long offset)
+        {
+            // pwrite64 — write at offset without changing file position
+            long savedPos = _vfs.Lseek(fd, 0, SeekWhence.SEEK_CUR);
+            _vfs.Lseek(fd, offset, SeekWhence.SEEK_SET);
+            byte[] data = _memory.Read(bufAddr, count);
+            int written = _vfs.Write(fd, data);
+            _vfs.Lseek(fd, savedPos, SeekWhence.SEEK_SET);
+            return written;
+        }
 
         private long HandleUnimplemented(int num)
         {

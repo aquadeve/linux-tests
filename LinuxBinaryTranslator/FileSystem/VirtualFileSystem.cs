@@ -305,6 +305,42 @@ namespace LinuxBinaryTranslator.FileSystem
             _mountPoints["/proc/self/maps"] = () => new MemoryFile(Array.Empty<byte>());
             _mountPoints["/proc/self/status"] = () => new MemoryFile(
                 Encoding.UTF8.GetBytes("Name:\tprogram\nState:\tR (running)\nPid:\t1000\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n"));
+
+            // Additional /proc nodes — from kernel fs/proc/
+            _mountPoints["/proc/self/cmdline"] = () => new MemoryFile(
+                Encoding.UTF8.GetBytes("program\0"));
+            _mountPoints["/proc/self/environ"] = () => new MemoryFile(
+                Encoding.UTF8.GetBytes("HOME=/\0USER=user\0PATH=/usr/bin:/bin\0TERM=xterm-256color\0"));
+            _mountPoints["/proc/self/auxv"] = () => new MemoryFile(Array.Empty<byte>());
+            _mountPoints["/proc/self/comm"] = () => new MemoryFile(Encoding.UTF8.GetBytes("program\n"));
+            _mountPoints["/proc/self/limits"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "Limit                     Soft Limit           Hard Limit           Units     \n" +
+                "Max open files            1024                 1048576              files     \n" +
+                "Max stack size            8388608              unlimited            bytes     \n"));
+            _mountPoints["/proc/self/fd/0"] = () => _fds[0];
+            _mountPoints["/proc/self/fd/1"] = () => _fds[1];
+            _mountPoints["/proc/self/fd/2"] = () => _fds[2];
+            _mountPoints["/proc/meminfo"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "MemTotal:         524288 kB\nMemFree:          262144 kB\nMemAvailable:     393216 kB\nBuffers:           16384 kB\nCached:            65536 kB\n"));
+            _mountPoints["/proc/cpuinfo"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "processor\t: 0\nvendor_id\t: UWPTranslator\nmodel name\t: x86_64 Translated\ncpu MHz\t\t: 1000.000\ncache size\t: 256 KB\n"));
+            _mountPoints["/proc/version"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "Linux version 6.1.0-uwp-translator (uwp@translator) (gcc (UWP) 12.0) #1 SMP\n"));
+            _mountPoints["/proc/uptime"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                $"{Environment.TickCount / 1000}.00 {Environment.TickCount / 1000}.00\n"));
+
+            // /etc nodes — common configuration files programs expect
+            _mountPoints["/etc/hostname"] = () => new MemoryFile(Encoding.UTF8.GetBytes("localhost\n"));
+            _mountPoints["/etc/passwd"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n"));
+            _mountPoints["/etc/group"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "root:x:0:\nuser:x:1000:\n"));
+            _mountPoints["/etc/nsswitch.conf"] = () => new MemoryFile(Encoding.UTF8.GetBytes(
+                "passwd: files\ngroup: files\nhosts: files dns\n"));
+            _mountPoints["/etc/localtime"] = () => new MemoryFile(Array.Empty<byte>());
+
+            // /tmp — writable temp directory support
+            _mountPoints["/tmp"] = () => new MemoryFile(Array.Empty<byte>());
         }
 
         public int Open(string path, int flags, int mode)
@@ -316,6 +352,11 @@ namespace LinuxBinaryTranslator.FileSystem
                 _fds[fd] = factory();
                 return fd;
             }
+
+            // Try host filesystem bridge
+            int hostResult = TryOpenHostFile(path, flags);
+            if (hostResult >= 0)
+                return hostResult;
 
             // For paths that don't exist in our VFS, return ENOENT
             return -Syscall.Errno.ENOENT;
@@ -371,7 +412,10 @@ namespace LinuxBinaryTranslator.FileSystem
             }
 
             // Directories
-            if (path == "/" || path == "/dev" || path == "/proc" || path == "/tmp")
+            if (path == "/" || path == "/dev" || path == "/proc" || path == "/tmp" ||
+                path == "/etc" || path == "/proc/self" || path == "/proc/self/fd" ||
+                path == "/dev/fd" || path == "/home" || path == "/home/user" ||
+                path == "/usr" || path == "/usr/bin" || path == "/bin")
             {
                 return new VfsStatResult
                 {
@@ -387,7 +431,10 @@ namespace LinuxBinaryTranslator.FileSystem
         public bool Access(string path, int mode)
         {
             return _mountPoints.ContainsKey(path) ||
-                   path == "/" || path == "/dev" || path == "/proc" || path == "/tmp";
+                   path == "/" || path == "/dev" || path == "/proc" || path == "/tmp" ||
+                   path == "/etc" || path == "/proc/self" || path == "/proc/self/fd" ||
+                   path == "/dev/fd" || path == "/home" || path == "/home/user" ||
+                   path == "/usr" || path == "/usr/bin" || path == "/bin";
         }
 
         public int Dup(int oldfd)
@@ -439,6 +486,56 @@ namespace LinuxBinaryTranslator.FileSystem
         public void Mount(string path, Func<IVirtualFile> fileFactory)
         {
             _mountPoints[path] = fileFactory;
+        }
+
+        /// <summary>
+        /// Register a host directory as accessible from the virtual filesystem.
+        /// This bridges UWP app local storage into the emulated Linux environment,
+        /// allowing binaries to read/write files from Xbox One local storage.
+        /// </summary>
+        public void MountHostDirectory(string vfsPath, Func<string, byte[]?> readFile, Func<string, byte[], bool> writeFile, Func<string, bool> fileExists)
+        {
+            _hostDirectories[vfsPath] = new HostDirectoryBridge
+            {
+                ReadFile = readFile,
+                WriteFile = writeFile,
+                FileExists = fileExists,
+            };
+        }
+
+        // Host filesystem bridge for UWP local storage integration
+        private readonly Dictionary<string, HostDirectoryBridge> _hostDirectories = new Dictionary<string, HostDirectoryBridge>();
+
+        private class HostDirectoryBridge
+        {
+            public Func<string, byte[]?> ReadFile { get; set; } = _ => null;
+            public Func<string, byte[], bool> WriteFile { get; set; } = (_, __) => false;
+            public Func<string, bool> FileExists { get; set; } = _ => false;
+        }
+
+        /// <summary>
+        /// Try to open a file via the host filesystem bridge.
+        /// </summary>
+        private int TryOpenHostFile(string path, int flags)
+        {
+            foreach (var kvp in _hostDirectories)
+            {
+                if (path.StartsWith(kvp.Key))
+                {
+                    string relative = path.Substring(kvp.Key.Length).TrimStart('/');
+                    if (kvp.Value.FileExists(relative))
+                    {
+                        byte[]? data = kvp.Value.ReadFile(relative);
+                        if (data != null)
+                        {
+                            int fd = _nextFd++;
+                            _fds[fd] = new MemoryFile(data);
+                            return fd;
+                        }
+                    }
+                }
+            }
+            return -Syscall.Errno.ENOENT;
         }
     }
 }
