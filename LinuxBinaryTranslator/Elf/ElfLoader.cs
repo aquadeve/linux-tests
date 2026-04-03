@@ -1,0 +1,248 @@
+// Copyright (c) Linux Binary Translator contributors.
+// Licensed under the GPLv3+ license.
+//
+// ELF binary loader. Parses and loads 64-bit Linux ELF executables into
+// the virtual memory space for translation and execution.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using LinuxBinaryTranslator.Memory;
+
+namespace LinuxBinaryTranslator.Elf
+{
+    /// <summary>
+    /// Represents a loaded ELF segment in virtual memory.
+    /// </summary>
+    public sealed class LoadedSegment
+    {
+        public ulong VirtualAddress { get; }
+        public ulong MemorySize { get; }
+        public ulong FileSize { get; }
+        public bool Readable { get; }
+        public bool Writable { get; }
+        public bool Executable { get; }
+
+        public LoadedSegment(ulong vaddr, ulong memsz, ulong filesz,
+                             bool readable, bool writable, bool executable)
+        {
+            VirtualAddress = vaddr;
+            MemorySize = memsz;
+            FileSize = filesz;
+            Readable = readable;
+            Writable = writable;
+            Executable = executable;
+        }
+    }
+
+    /// <summary>
+    /// Result of loading an ELF binary.
+    /// </summary>
+    public sealed class ElfLoadResult
+    {
+        public ulong EntryPoint { get; set; }
+        public ulong ProgramHeaderAddress { get; set; }
+        public ushort ProgramHeaderEntrySize { get; set; }
+        public ushort ProgramHeaderCount { get; set; }
+        public ulong BaseAddress { get; set; }
+        public ulong BrkAddress { get; set; }
+        public ushort Machine { get; set; }
+        public List<LoadedSegment> Segments { get; } = new List<LoadedSegment>();
+    }
+
+    /// <summary>
+    /// Loads Linux ELF64 binaries into the translator's virtual memory.
+    /// Parses ELF headers and program segments according to the format defined
+    /// in the Linux kernel's include/uapi/linux/elf.h.
+    /// </summary>
+    public sealed class ElfLoader
+    {
+        private readonly VirtualMemoryManager _memory;
+
+        public ElfLoader(VirtualMemoryManager memory)
+        {
+            _memory = memory;
+        }
+
+        /// <summary>
+        /// Load an ELF binary from a byte array into virtual memory.
+        /// </summary>
+        public ElfLoadResult Load(byte[] elfData)
+        {
+            if (elfData == null || elfData.Length < 64)
+                throw new ElfLoadException("Data too small to be a valid ELF binary");
+
+            var header = ParseHeader(elfData);
+            ValidateHeader(header);
+
+            var programHeaders = ParseProgramHeaders(elfData, header);
+            var result = new ElfLoadResult
+            {
+                EntryPoint = header.e_entry,
+                ProgramHeaderEntrySize = header.e_phentsize,
+                ProgramHeaderCount = header.e_phnum,
+                Machine = header.e_machine,
+            };
+
+            ulong lowestAddr = ulong.MaxValue;
+            ulong highestAddr = 0;
+
+            // Load all PT_LOAD segments into virtual memory
+            foreach (var phdr in programHeaders)
+            {
+                if (!phdr.IsLoadable || phdr.p_memsz == 0)
+                    continue;
+
+                ulong alignedAddr = AlignDown(phdr.p_vaddr, PageSize);
+                ulong alignedEnd = AlignUp(phdr.p_vaddr + phdr.p_memsz, PageSize);
+                ulong regionSize = alignedEnd - alignedAddr;
+
+                // Track address range
+                if (alignedAddr < lowestAddr)
+                    lowestAddr = alignedAddr;
+                if (alignedEnd > highestAddr)
+                    highestAddr = alignedEnd;
+
+                // Allocate virtual memory region
+                var protection = MemoryProtection.None;
+                if (phdr.IsReadable) protection |= MemoryProtection.Read;
+                if (phdr.IsWritable) protection |= MemoryProtection.Write;
+                if (phdr.IsExecutable) protection |= MemoryProtection.Execute;
+
+                _memory.Map(alignedAddr, regionSize, protection);
+
+                // Copy file data into the mapped region
+                if (phdr.p_filesz > 0)
+                {
+                    ulong fileOffset = phdr.p_offset;
+                    ulong copyLen = Math.Min(phdr.p_filesz, (ulong)elfData.Length - fileOffset);
+                    var segment = new byte[copyLen];
+                    Array.Copy(elfData, (long)fileOffset, segment, 0, (long)copyLen);
+                    _memory.Write(phdr.p_vaddr, segment);
+                }
+
+                // Zero-fill BSS (memory beyond file data)
+                if (phdr.p_memsz > phdr.p_filesz)
+                {
+                    ulong bssStart = phdr.p_vaddr + phdr.p_filesz;
+                    ulong bssSize = phdr.p_memsz - phdr.p_filesz;
+                    _memory.Zero(bssStart, bssSize);
+                }
+
+                result.Segments.Add(new LoadedSegment(
+                    phdr.p_vaddr, phdr.p_memsz, phdr.p_filesz,
+                    phdr.IsReadable, phdr.IsWritable, phdr.IsExecutable));
+            }
+
+            result.BaseAddress = lowestAddr == ulong.MaxValue ? 0 : lowestAddr;
+            result.BrkAddress = highestAddr;
+
+            // Store program headers in memory for auxvec AT_PHDR
+            if (header.e_phoff > 0 && header.e_phnum > 0)
+            {
+                ulong phdrSize = (ulong)(header.e_phentsize * header.e_phnum);
+                // Program headers may already be in a loaded segment
+                result.ProgramHeaderAddress = result.BaseAddress + header.e_phoff;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Parse the ELF64 file header from raw bytes.
+        /// </summary>
+        private static Elf64Header ParseHeader(byte[] data)
+        {
+            using var reader = new BinaryReader(new MemoryStream(data));
+            var header = new Elf64Header
+            {
+                e_ident = reader.ReadBytes(ElfConstants.EI_NIDENT),
+                e_type = reader.ReadUInt16(),
+                e_machine = reader.ReadUInt16(),
+                e_version = reader.ReadUInt32(),
+                e_entry = reader.ReadUInt64(),
+                e_phoff = reader.ReadUInt64(),
+                e_shoff = reader.ReadUInt64(),
+                e_flags = reader.ReadUInt32(),
+                e_ehsize = reader.ReadUInt16(),
+                e_phentsize = reader.ReadUInt16(),
+                e_phnum = reader.ReadUInt16(),
+                e_shentsize = reader.ReadUInt16(),
+                e_shnum = reader.ReadUInt16(),
+                e_shstrndx = reader.ReadUInt16()
+            };
+            return header;
+        }
+
+        /// <summary>
+        /// Validate the ELF header for compatibility.
+        /// </summary>
+        private static void ValidateHeader(Elf64Header header)
+        {
+            if (!header.IsValid())
+                throw new ElfLoadException("Invalid ELF magic number");
+
+            if (!header.Is64Bit())
+                throw new ElfLoadException("Only 64-bit ELF binaries are supported");
+
+            if (!header.IsLittleEndian())
+                throw new ElfLoadException("Only little-endian ELF binaries are supported");
+
+            if (!header.IsX86_64())
+                throw new ElfLoadException(
+                    $"Unsupported machine type: {header.e_machine}. Only x86_64 (EM_X86_64={ElfConstants.EM_X86_64}) is supported");
+
+            if (!header.IsExecutable() && !header.IsSharedObject())
+                throw new ElfLoadException("ELF binary must be ET_EXEC or ET_DYN (static or PIE executable)");
+        }
+
+        /// <summary>
+        /// Parse all program headers from the ELF file.
+        /// </summary>
+        private static List<Elf64ProgramHeader> ParseProgramHeaders(byte[] data, Elf64Header header)
+        {
+            var headers = new List<Elf64ProgramHeader>();
+            long offset = (long)header.e_phoff;
+
+            for (int i = 0; i < header.e_phnum; i++)
+            {
+                if (offset + header.e_phentsize > data.Length)
+                    throw new ElfLoadException($"Program header {i} extends beyond file");
+
+                using var reader = new BinaryReader(new MemoryStream(data, (int)offset, header.e_phentsize));
+                var phdr = new Elf64ProgramHeader
+                {
+                    p_type = reader.ReadUInt32(),
+                    p_flags = reader.ReadUInt32(),
+                    p_offset = reader.ReadUInt64(),
+                    p_vaddr = reader.ReadUInt64(),
+                    p_paddr = reader.ReadUInt64(),
+                    p_filesz = reader.ReadUInt64(),
+                    p_memsz = reader.ReadUInt64(),
+                    p_align = reader.ReadUInt64()
+                };
+                headers.Add(phdr);
+                offset += header.e_phentsize;
+            }
+
+            return headers;
+        }
+
+        private const ulong PageSize = 4096;
+
+        private static ulong AlignDown(ulong value, ulong alignment)
+            => value & ~(alignment - 1);
+
+        private static ulong AlignUp(ulong value, ulong alignment)
+            => (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    /// <summary>
+    /// Exception thrown when ELF loading fails.
+    /// </summary>
+    public class ElfLoadException : Exception
+    {
+        public ElfLoadException(string message) : base(message) { }
+        public ElfLoadException(string message, Exception inner) : base(message, inner) { }
+    }
+}
