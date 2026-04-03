@@ -30,17 +30,33 @@ namespace LinuxBinaryTranslator
     }
 
     /// <summary>
+    /// Request to execute a new binary via execve.
+    /// Set by the syscall handler when execve is called.
+    /// </summary>
+    public sealed class ExecveRequest
+    {
+        public byte[] ElfData { get; set; } = Array.Empty<byte>();
+        public string[] Argv { get; set; } = Array.Empty<string>();
+        public string[] Envp { get; set; } = Array.Empty<string>();
+        public string Path { get; set; } = "";
+    }
+
+    /// <summary>
     /// Orchestrates the loading and execution of a Linux ELF binary.
     /// Connects all subsystems: ELF loader → block translator → syscall handler → VFS.
+    /// Supports rootfs-based execution for running Linux distribution shells.
     /// </summary>
     public sealed class ExecutionEngine
     {
-        private readonly VirtualMemoryManager _memory;
+        private VirtualMemoryManager _memory;
         private readonly VirtualFileSystem _vfs;
-        private readonly BlockTranslator _translator;
-        private readonly SyscallHandler _syscallHandler;
-        private readonly CpuState _cpu;
+        private BlockTranslator _translator;
+        private SyscallHandler _syscallHandler;
+        private CpuState _cpu;
         private readonly Action<string> _logger;
+        private readonly Func<byte[], int, int, int>? _stdinRead;
+        private readonly Action<byte[], int, int>? _stdoutWrite;
+        private readonly Action<byte[], int, int>? _stderrWrite;
 
         // Stack configuration
         private const ulong StackBase = 0x7FFFFFFFE000UL;
@@ -57,11 +73,15 @@ namespace LinuxBinaryTranslator
             Action<string>? logger = null)
         {
             _logger = logger ?? (_ => { });
+            _stdinRead = stdinRead;
+            _stdoutWrite = stdoutWrite;
+            _stderrWrite = stderrWrite;
             _memory = new VirtualMemoryManager();
             _vfs = new VirtualFileSystem(stdinRead, stdoutWrite, stderrWrite);
             _cpu = new CpuState();
             _translator = new BlockTranslator(_memory);
             _syscallHandler = new SyscallHandler(_memory, _vfs, _logger);
+            _syscallHandler.SetExecutionEngine(this);
             _translator.SyscallHandler = _syscallHandler.Dispatch;
         }
 
@@ -92,6 +112,8 @@ namespace LinuxBinaryTranslator
 
         /// <summary>
         /// Execute the loaded binary until it exits or an error occurs.
+        /// Supports execve — when a process calls execve, the engine resets
+        /// and loads the new binary, continuing execution transparently.
         /// </summary>
         public async Task<ExecutionResult> ExecuteAsync(CancellationToken cancellationToken = default)
         {
@@ -105,6 +127,15 @@ namespace LinuxBinaryTranslator
                 {
                     while (!_cpu.Halted && !cancellationToken.IsCancellationRequested)
                     {
+                        // Check for pending execve request
+                        ExecveRequest? execReq = _syscallHandler.PendingExecve;
+                        if (execReq != null)
+                        {
+                            _syscallHandler.PendingExecve = null;
+                            HandleExecve(execReq);
+                            continue; // Start executing the new binary
+                        }
+
                         // Check for pending signals at safe points
                         if (_syscallHandler.DeliverPendingSignal(_cpu, _memory))
                         {
@@ -160,6 +191,93 @@ namespace LinuxBinaryTranslator
                 ElapsedTime = DateTime.UtcNow - startTime,
                 Error = error,
             };
+        }
+
+        /// <summary>
+        /// Handle an execve request: reset the CPU state, memory, and block cache,
+        /// then load the new binary and prepare it for execution.
+        /// This replaces the current process image — just like the real execve.
+        /// </summary>
+        private void HandleExecve(ExecveRequest request)
+        {
+            _logger($"execve: loading {request.Path} with {request.Argv.Length} args");
+
+            // Reset memory manager (clears all mappings)
+            _memory = new VirtualMemoryManager();
+
+            // Reset CPU state
+            _cpu = new CpuState();
+
+            // Reset block translator cache (old translated code is invalid)
+            _translator = new BlockTranslator(_memory);
+
+            // Reconnect syscall handler with new memory
+            _syscallHandler = new SyscallHandler(_memory, _vfs, _logger);
+            _syscallHandler.SetExecutionEngine(this);
+            _translator.SyscallHandler = _syscallHandler.Dispatch;
+
+            try
+            {
+                // Load the new binary
+                var loader = new ElfLoader(_memory);
+                var loadResult = loader.Load(request.ElfData);
+
+                _memory.InitializeBrk(loadResult.BrkAddress);
+
+                // Set up the stack with new argv/envp
+                SetupStack(loadResult, request.Argv, request.Envp);
+
+                // Jump to the new entry point
+                _cpu.RIP = loadResult.EntryPoint;
+
+                _logger($"execve: entry=0x{loadResult.EntryPoint:X16}, " +
+                        $"segments={loadResult.Segments.Count}");
+            }
+            catch (Exception ex)
+            {
+                _logger($"execve failed: {ex.Message}");
+                _cpu.Halted = true;
+                _cpu.ExitCode = 126; // Cannot execute
+            }
+        }
+
+        /// <summary>
+        /// Boot a Linux distribution from a rootfs.
+        /// Loads the rootfs into the VFS and launches the default shell.
+        /// </summary>
+        public Elf.ElfLoadResult BootRootfs(FileSystem.RootfsManager rootfs, string? shellOverride = null, string[]? extraArgs = null)
+        {
+            var info = rootfs.Info;
+            if (info == null)
+                throw new InvalidOperationException("Rootfs not loaded");
+
+            string shellPath = shellOverride ?? info.ShellPath;
+
+            // Read the shell binary from rootfs
+            byte[]? shellData = rootfs.ReadFile(shellPath);
+            if (shellData == null)
+                throw new Elf.ElfLoadException($"Shell not found in rootfs: {shellPath}");
+
+            _logger($"Booting {info.DistroName} {info.Version}: {shellPath}");
+
+            // Build argv: [shell, --login] or [shell, ...extraArgs]
+            var argv = new List<string> { shellPath };
+            if (extraArgs != null && extraArgs.Length > 0)
+                argv.AddRange(extraArgs);
+            else
+                argv.Add("--login");
+
+            // Get environment from rootfs
+            string[] envp = rootfs.GetDefaultEnvironment();
+
+            // Update /proc/self entries for the shell
+            _vfs.Mount("/proc/self/exe", () => new FileSystem.MemoryFile(
+                Encoding.UTF8.GetBytes(shellPath)));
+            _vfs.Mount("/proc/self/cmdline", () => new FileSystem.MemoryFile(
+                Encoding.UTF8.GetBytes(string.Join("\0", argv) + "\0")));
+
+            // Load and prepare the shell binary
+            return LoadBinary(shellData, argv.ToArray(), envp);
         }
 
         /// <summary>

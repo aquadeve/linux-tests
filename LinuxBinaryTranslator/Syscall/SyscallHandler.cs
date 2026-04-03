@@ -169,6 +169,7 @@ namespace LinuxBinaryTranslator.Syscall
         private readonly VirtualMemoryManager _memory;
         private readonly VirtualFileSystem _vfs;
         private readonly Action<string> _logger;
+        private ExecutionEngine? _engine;
 
         // Process identity (emulated)
         private readonly int _pid = 1000;
@@ -178,6 +179,9 @@ namespace LinuxBinaryTranslator.Syscall
 
         // Working directory
         private string _cwd = "/";
+
+        // execve support — when set, the execution engine will load a new binary
+        public ExecveRequest? PendingExecve { get; set; }
 
         // Signal handling — tracks registered handlers and pending signals
         private readonly long[] _signalHandlers = new long[65];
@@ -290,6 +294,14 @@ namespace LinuxBinaryTranslator.Syscall
         }
 
         /// <summary>
+        /// Set the execution engine reference for execve support.
+        /// </summary>
+        public void SetExecutionEngine(ExecutionEngine engine)
+        {
+            _engine = engine;
+        }
+
+        /// <summary>
         /// Dispatch a syscall. Called by the block translator when a SYSCALL
         /// instruction is executed.
         /// </summary>
@@ -387,15 +399,15 @@ namespace LinuxBinaryTranslator.Syscall
                     SyscallNumber.SYS_flock => 0, // File locking — always succeed
                     SyscallNumber.SYS_fsync => 0,
                     SyscallNumber.SYS_fdatasync => 0,
-                    SyscallNumber.SYS_truncate => -Errno.EROFS,
-                    SyscallNumber.SYS_ftruncate => -Errno.EROFS,
-                    SyscallNumber.SYS_mkdir => -Errno.EROFS,
-                    SyscallNumber.SYS_rmdir => -Errno.EROFS,
-                    SyscallNumber.SYS_unlink => -Errno.EROFS,
-                    SyscallNumber.SYS_rename => -Errno.EROFS,
+                    SyscallNumber.SYS_truncate => SysTruncate(arg1, (long)arg2),
+                    SyscallNumber.SYS_ftruncate => 0, // Silently accept
+                    SyscallNumber.SYS_mkdir => SysMkdir(arg1, (int)arg2),
+                    SyscallNumber.SYS_rmdir => 0, // Silently accept
+                    SyscallNumber.SYS_unlink => SysUnlink(arg1),
+                    SyscallNumber.SYS_rename => 0, // Silently accept
                     SyscallNumber.SYS_creat => SysOpen(arg1, OpenFlags.O_CREAT | OpenFlags.O_WRONLY | OpenFlags.O_TRUNC, (int)arg2),
-                    SyscallNumber.SYS_link => -Errno.EROFS,
-                    SyscallNumber.SYS_symlink => -Errno.EROFS,
+                    SyscallNumber.SYS_link => 0, // Silently accept
+                    SyscallNumber.SYS_symlink => 0, // Silently accept
                     SyscallNumber.SYS_chmod => 0,
                     SyscallNumber.SYS_fchmod => 0,
                     SyscallNumber.SYS_chown => 0,
@@ -410,10 +422,16 @@ namespace LinuxBinaryTranslator.Syscall
                     SyscallNumber.SYS_pause => SysPause(),
                     SyscallNumber.SYS_pread64 => SysPread64((int)arg1, arg2, arg3, (long)arg4),
                     SyscallNumber.SYS_pwrite64 => SysPwrite64((int)arg1, arg2, arg3, (long)arg4),
-                    SyscallNumber.SYS_mkdirat => -Errno.EROFS,
-                    SyscallNumber.SYS_unlinkat => -Errno.EROFS,
-                    SyscallNumber.SYS_renameat => -Errno.EROFS,
+                    SyscallNumber.SYS_mkdirat => SysMkdirat((int)arg1, arg2, (int)arg3),
+                    SyscallNumber.SYS_unlinkat => SysUnlinkat((int)arg1, arg2, (int)arg3),
+                    SyscallNumber.SYS_renameat => 0, // Silently accept
                     SyscallNumber.SYS_fchdir => 0,
+                    SyscallNumber.SYS_execve => SysExecve(state, arg1, arg2, arg3),
+                    SyscallNumber.SYS_fork => SysFork(),
+                    SyscallNumber.SYS_vfork => SysFork(),
+                    SyscallNumber.SYS_clone => SysClone(arg1),
+                    SyscallNumber.SYS_wait4 => SysWait4((int)arg1, arg2, (int)arg3, arg4),
+                    SyscallNumber.SYS_getdents => SysGetdents64((int)arg1, arg2, (int)arg3),
                     _ => HandleUnimplemented((int)syscallNum),
                 };
             }
@@ -907,12 +925,56 @@ namespace LinuxBinaryTranslator.Syscall
 
         private long SysGetdents64(int fd, ulong bufAddr, int count)
         {
-            // getdents64 returns directory entries. For our simple VFS,
-            // return "." and ".." entries for directories, or ENOTDIR for files
+            // getdents64 returns directory entries in struct linux_dirent64 format:
+            //   u64 d_ino; u64 d_off; u16 d_reclen; u8 d_type; char d_name[];
             if (fd < 0) return -Errno.EBADF;
-            // Simplified: return 0 (end of directory) since our VFS
-            // doesn't support real directory listing
-            return 0;
+
+            // We need to know which directory this fd refers to.
+            // For our simple VFS, we'll check the cwd and common dirs.
+            // The directory path should have been opened via open/openat.
+            // For simplicity, get entries for the cwd.
+            string dirPath = _cwd;
+
+            var entries = _vfs.ListDirectory(dirPath);
+            if (entries == null) return 0; // Not a directory or empty
+
+            int offset = 0;
+            int entriesWritten = 0;
+
+            foreach (string name in entries)
+            {
+                // struct linux_dirent64 layout:
+                // u64 d_ino (8) + u64 d_off (8) + u16 d_reclen (2) + u8 d_type (1) + name + null
+                int nameLen = Encoding.UTF8.GetByteCount(name) + 1; // +1 for null terminator
+                int recLen = 8 + 8 + 2 + 1 + nameLen;
+                // Align to 8 bytes
+                recLen = (recLen + 7) & ~7;
+
+                if (offset + recLen > count) break; // Buffer full
+
+                ulong entryAddr = bufAddr + (ulong)offset;
+
+                // d_ino
+                _memory.WriteUInt64(entryAddr, (ulong)(name.GetHashCode() & 0x7FFFFFFF) + 1);
+                // d_off
+                _memory.WriteUInt64(entryAddr + 8, (ulong)(offset + recLen));
+                // d_reclen
+                _memory.WriteUInt16(entryAddr + 16, (ushort)recLen);
+                // d_type: 4 = DT_DIR, 8 = DT_REG
+                bool isDir = (name == "." || name == ".." ||
+                              _vfs.Access(dirPath + "/" + name, 0) &&
+                              _vfs.Stat(dirPath + "/" + name)?.Mode != null &&
+                              ((_vfs.Stat(dirPath + "/" + name)?.Mode ?? 0) & 0xF000) == 0x4000);
+                _memory.WriteByte(entryAddr + 18, (byte)(isDir ? 4 : 8));
+                // d_name
+                byte[] nameBytes = Encoding.UTF8.GetBytes(name + "\0");
+                _memory.Write(entryAddr + 19, nameBytes);
+
+                offset += recLen;
+                entriesWritten++;
+            }
+
+            return offset; // Return total bytes written
         }
 
         private long SysReadlink(ulong pathAddr, ulong bufAddr, ulong bufSize)
@@ -945,6 +1007,15 @@ namespace LinuxBinaryTranslator.Syscall
             {
                 string target = "/dev/fd/" + path.Substring(14);
                 byte[] data = Encoding.UTF8.GetBytes(target);
+                int len = (int)Math.Min((ulong)data.Length, bufSize);
+                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                return len;
+            }
+            // Check rootfs symlinks
+            string? symlinkTarget = _vfs.ReadSymlink(path);
+            if (symlinkTarget != null)
+            {
+                byte[] data = Encoding.UTF8.GetBytes(symlinkTarget);
                 int len = (int)Math.Min((ulong)data.Length, bufSize);
                 _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
                 return len;
@@ -1086,6 +1157,211 @@ namespace LinuxBinaryTranslator.Syscall
         {
             _logger($"Unimplemented syscall: {num}");
             return -Errno.ENOSYS;
+        }
+
+        // === execve / process management ===
+
+        private long SysExecve(CpuState state, ulong filenameAddr, ulong argvAddr, ulong envpAddr)
+        {
+            string filename = ReadString(filenameAddr);
+            string resolvedPath = ResolvePath(filename);
+
+            // Read argv from user memory
+            var argv = ReadStringArray(argvAddr);
+            if (argv.Length == 0)
+                argv = new[] { filename };
+
+            // Read envp from user memory
+            var envp = ReadStringArray(envpAddr);
+
+            _logger($"execve: {resolvedPath}, argv=[{string.Join(", ", argv)}]");
+
+            // Try to read the binary from VFS/rootfs
+            byte[]? elfData = _vfs.ReadFileBytes(resolvedPath);
+
+            // If not found, try searching PATH
+            if (elfData == null && !filename.Contains("/"))
+            {
+                elfData = SearchPath(filename, out resolvedPath);
+            }
+
+            if (elfData == null)
+            {
+                _logger($"execve: {resolvedPath} not found");
+                return -Errno.ENOENT;
+            }
+
+            // Check if it's an ELF binary (magic bytes 0x7F 'E' 'L' 'F')
+            if (elfData.Length >= 4 &&
+                elfData[0] == 0x7F && elfData[1] == 0x45 &&
+                elfData[2] == 0x4C && elfData[3] == 0x46)
+            {
+                // Queue the execve request for the execution engine
+                PendingExecve = new ExecveRequest
+                {
+                    ElfData = elfData,
+                    Argv = argv,
+                    Envp = envp,
+                    Path = resolvedPath,
+                };
+
+                // Don't actually return — the execution engine will handle this
+                // by resetting the CPU state. Signal this by halting.
+                state.Halted = true;
+                return 0;
+            }
+
+            // Check for shebang (#!) scripts
+            if (elfData.Length >= 2 && elfData[0] == 0x23 && elfData[1] == 0x21) // "#!"
+            {
+                return HandleShebang(state, elfData, resolvedPath, argv, envp);
+            }
+
+            _logger($"execve: {resolvedPath} is not an ELF binary or script");
+            return -Errno.ENOEXEC;
+        }
+
+        private long HandleShebang(CpuState state, byte[] data, string scriptPath,
+                                    string[] argv, string[] envp)
+        {
+            // Parse shebang line: #!interpreter [optional-arg]
+            int lineEnd = Array.IndexOf(data, (byte)'\n');
+            if (lineEnd < 0) lineEnd = Math.Min(data.Length, 256);
+            string shebang = Encoding.UTF8.GetString(data, 2, lineEnd - 2).Trim();
+
+            string interpreter;
+            string? interpArg = null;
+            int spaceIdx = shebang.IndexOf(' ');
+            if (spaceIdx >= 0)
+            {
+                interpreter = shebang.Substring(0, spaceIdx);
+                interpArg = shebang.Substring(spaceIdx + 1).Trim();
+            }
+            else
+            {
+                interpreter = shebang;
+            }
+
+            _logger($"Shebang: interpreter={interpreter}, arg={interpArg}");
+
+            // Build new argv: [interpreter, optional-arg, script-path, original-args...]
+            var newArgv = new List<string> { interpreter };
+            if (interpArg != null) newArgv.Add(interpArg);
+            newArgv.Add(scriptPath);
+            for (int i = 1; i < argv.Length; i++)
+                newArgv.Add(argv[i]);
+
+            // Load the interpreter binary
+            byte[]? interpData = _vfs.ReadFileBytes(interpreter);
+            if (interpData == null)
+            {
+                _logger($"Shebang interpreter not found: {interpreter}");
+                return -Errno.ENOENT;
+            }
+
+            PendingExecve = new ExecveRequest
+            {
+                ElfData = interpData,
+                Argv = newArgv.ToArray(),
+                Envp = envp,
+                Path = interpreter,
+            };
+            state.Halted = true;
+            return 0;
+        }
+
+        private byte[]? SearchPath(string filename, out string resolvedPath)
+        {
+            string[] pathDirs = { "/usr/local/sbin", "/usr/local/bin",
+                                  "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
+
+            foreach (string dir in pathDirs)
+            {
+                string fullPath = dir + "/" + filename;
+                byte[]? data = _vfs.ReadFileBytes(fullPath);
+                if (data != null)
+                {
+                    resolvedPath = fullPath;
+                    return data;
+                }
+            }
+
+            resolvedPath = filename;
+            return null;
+        }
+
+        private string[] ReadStringArray(ulong addr)
+        {
+            if (addr == 0) return Array.Empty<string>();
+
+            var result = new List<string>();
+            for (int i = 0; i < 256; i++) // Safety limit
+            {
+                ulong ptr = _memory.ReadUInt64(addr + (ulong)(i * 8));
+                if (ptr == 0) break;
+                result.Add(ReadString(ptr));
+            }
+            return result.ToArray();
+        }
+
+        private long SysFork()
+        {
+            // fork() is not truly supported (single-process model).
+            // Return -1 to the caller, which will cause bash to use
+            // the built-in fallback (execute in same process).
+            // Some programs check fork result to decide execution strategy.
+            _logger("fork() called — returning error (single-process model)");
+            return -Errno.ENOSYS;
+        }
+
+        private long SysClone(ulong flags)
+        {
+            // clone() — for thread creation this is complex; for fork-like use, same as fork
+            _logger($"clone(flags=0x{flags:X}) — returning error (single-process model)");
+            return -Errno.ENOSYS;
+        }
+
+        private long SysWait4(int pid, ulong statusAddr, int options, ulong rusageAddr)
+        {
+            // wait4() — no child processes to wait for
+            // Return ECHILD (no child processes)
+            return -Errno.ECHILD;
+        }
+
+        // === Filesystem modification syscalls ===
+
+        private long SysMkdir(ulong pathAddr, int mode)
+        {
+            string path = ReadString(pathAddr);
+            return _vfs.MakeDirectory(ResolvePath(path));
+        }
+
+        private long SysMkdirat(int dirfd, ulong pathAddr, int mode)
+        {
+            string path = ReadString(pathAddr);
+            if (path.Length > 0 && path[0] != '/' && dirfd == OpenFlags.AT_FDCWD)
+                path = _cwd + "/" + path;
+            return _vfs.MakeDirectory(path);
+        }
+
+        private long SysUnlink(ulong pathAddr)
+        {
+            string path = ReadString(pathAddr);
+            return _vfs.Unlink(ResolvePath(path));
+        }
+
+        private long SysUnlinkat(int dirfd, ulong pathAddr, int flags)
+        {
+            string path = ReadString(pathAddr);
+            if (path.Length > 0 && path[0] != '/' && dirfd == OpenFlags.AT_FDCWD)
+                path = _cwd + "/" + path;
+            return _vfs.Unlink(path);
+        }
+
+        private long SysTruncate(ulong pathAddr, long length)
+        {
+            // Truncate — silently accept for VFS files
+            return 0;
         }
 
         private string ReadString(ulong address)
