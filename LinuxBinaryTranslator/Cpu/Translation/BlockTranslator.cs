@@ -613,6 +613,153 @@ namespace LinuxBinaryTranslator.Cpu
                     state.Halted = true;
                     return 0;
 
+                // MOVSXD r64, r/m32 (0x63 with REX.W) — sign-extend dword to qword
+                case 0x63:
+                {
+                    int val;
+                    if (inst.Mod == 3)
+                        val = (int)(uint)state.GetGpr(inst.RM);
+                    else
+                        val = (int)mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                    if (inst.RexW)
+                        state.SetGpr(inst.Reg, (ulong)(long)val);
+                    else
+                        state.SetGpr32(inst.Reg, (uint)val);
+                    return 0;
+                }
+
+                // XCHG r8, r/m8 (86)
+                case 0x86:
+                {
+                    byte a = (byte)state.GetGpr(inst.Reg);
+                    byte b;
+                    if (inst.Mod == 3)
+                    {
+                        b = (byte)state.GetGpr(inst.RM);
+                        SetRegByte(state, inst.RM, inst.HasRex, a);
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        b = mem.ReadByte(addr);
+                        mem.WriteByte(addr, a);
+                    }
+                    SetRegByte(state, inst.Reg, inst.HasRex, b);
+                    return 0;
+                }
+
+                // MOV AL, moffs8 (A0)
+                case 0xA0:
+                    state.AL = mem.ReadByte((ulong)inst.Immediate);
+                    return 0;
+
+                // MOV RAX/EAX, moffs (A1)
+                case 0xA1:
+                    if (inst.RexW)
+                        state.RAX = mem.ReadUInt64((ulong)inst.Immediate);
+                    else
+                        state.EAX = mem.ReadUInt32((ulong)inst.Immediate);
+                    return 0;
+
+                // MOV moffs8, AL (A2)
+                case 0xA2:
+                    mem.WriteByte((ulong)inst.Immediate, state.AL);
+                    return 0;
+
+                // MOV moffs, RAX/EAX (A3)
+                case 0xA3:
+                    if (inst.RexW)
+                        mem.WriteUInt64((ulong)inst.Immediate, state.RAX);
+                    else
+                        mem.WriteUInt32((ulong)inst.Immediate, state.EAX);
+                    return 0;
+
+                // CMPSB (A6) — compare [RSI] with [RDI]
+                case 0xA6:
+                {
+                    byte lhs = mem.ReadByte(state.RSI);
+                    byte rhs = mem.ReadByte(state.RDI);
+                    DoAlu8(7, lhs, rhs, state); // CMP sets flags
+                    if (state.GetFlag(X86Flags.DF)) { state.RSI--; state.RDI--; }
+                    else { state.RSI++; state.RDI++; }
+                    return 0;
+                }
+
+                // CMPSQ/CMPSD (A7)
+                case 0xA7:
+                    if (inst.RexW)
+                    {
+                        ulong lhs = mem.ReadUInt64(state.RSI);
+                        ulong rhs = mem.ReadUInt64(state.RDI);
+                        DoAlu64(7, lhs, rhs, state);
+                        if (state.GetFlag(X86Flags.DF)) { state.RSI -= 8; state.RDI -= 8; }
+                        else { state.RSI += 8; state.RDI += 8; }
+                    }
+                    else
+                    {
+                        uint lhs = mem.ReadUInt32(state.RSI);
+                        uint rhs = mem.ReadUInt32(state.RDI);
+                        DoAlu32(7, lhs, rhs, state);
+                        if (state.GetFlag(X86Flags.DF)) { state.RSI -= 4; state.RDI -= 4; }
+                        else { state.RSI += 4; state.RDI += 4; }
+                    }
+                    return 0;
+
+                // LODSB (AC) — load [RSI] into AL
+                case 0xAC:
+                    state.AL = mem.ReadByte(state.RSI);
+                    state.RSI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-1L) : 1;
+                    return 0;
+
+                // LODSD/LODSQ (AD)
+                case 0xAD:
+                    if (inst.RexW)
+                    {
+                        state.RAX = mem.ReadUInt64(state.RSI);
+                        state.RSI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-8L) : 8;
+                    }
+                    else
+                    {
+                        state.EAX = mem.ReadUInt32(state.RSI);
+                        state.RSI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-4L) : 4;
+                    }
+                    return 0;
+
+                // SCASB (AE) — compare AL with [RDI]
+                case 0xAE:
+                {
+                    byte rhs = mem.ReadByte(state.RDI);
+                    DoAlu8(7, state.AL, rhs, state);
+                    state.RDI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-1L) : 1;
+                    return 0;
+                }
+
+                // SCASD/SCASQ (AF)
+                case 0xAF:
+                    if (inst.RexW)
+                    {
+                        ulong rhs = mem.ReadUInt64(state.RDI);
+                        DoAlu64(7, state.RAX, rhs, state);
+                        state.RDI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-8L) : 8;
+                    }
+                    else
+                    {
+                        uint rhs = mem.ReadUInt32(state.RDI);
+                        DoAlu32(7, state.EAX, rhs, state);
+                        state.RDI += state.GetFlag(X86Flags.DF) ? unchecked((ulong)-4L) : 4;
+                    }
+                    return 0;
+
+                // ENTER (C8)
+                case 0xC8:
+                {
+                    ushort frameSize = (ushort)inst.Immediate;
+                    state.Push(mem, state.RBP);
+                    state.RBP = state.RSP;
+                    state.RSP -= frameSize;
+                    return 0;
+                }
+
                 default:
                     // Unimplemented — advance to next instruction
                     return 0;
@@ -762,6 +909,269 @@ namespace LinuxBinaryTranslator.Cpu
                 // Multi-byte NOP (0F 1F)
                 case 0x1F:
                     return 0;
+
+                // BSF — bit scan forward (0F BC)
+                case 0xBC:
+                {
+                    ulong src;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                    if (src == 0)
+                    {
+                        state.SetFlag(X86Flags.ZF, true);
+                    }
+                    else
+                    {
+                        state.SetFlag(X86Flags.ZF, false);
+                        int bit = 0;
+                        ulong tmp = src;
+                        while ((tmp & 1) == 0) { tmp >>= 1; bit++; }
+                        if (inst.RexW) state.SetGpr(inst.Reg, (ulong)bit);
+                        else state.SetGpr32(inst.Reg, (uint)bit);
+                    }
+                    return 0;
+                }
+
+                // BSR — bit scan reverse (0F BD)
+                case 0xBD:
+                {
+                    ulong src;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                    if (src == 0)
+                    {
+                        state.SetFlag(X86Flags.ZF, true);
+                    }
+                    else
+                    {
+                        state.SetFlag(X86Flags.ZF, false);
+                        int bit = inst.RexW ? 63 : 31;
+                        ulong mask = inst.RexW ? 0x8000000000000000UL : 0x80000000UL;
+                        while ((src & mask) == 0) { mask >>= 1; bit--; }
+                        if (inst.RexW) state.SetGpr(inst.Reg, (ulong)bit);
+                        else state.SetGpr32(inst.Reg, (uint)bit);
+                    }
+                    return 0;
+                }
+
+                // BT r/m, r (0F A3) — bit test
+                case 0xA3:
+                {
+                    ulong src;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                    int bit = (int)(state.GetGpr(inst.Reg) & (inst.RexW ? 63UL : 31UL));
+                    state.SetFlag(X86Flags.CF, ((src >> bit) & 1) != 0);
+                    return 0;
+                }
+
+                // BTS r/m, r (0F AB) — bit test and set
+                case 0xAB:
+                {
+                    ulong src;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); src = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr); }
+                    int bit = (int)(state.GetGpr(inst.Reg) & (inst.RexW ? 63UL : 31UL));
+                    state.SetFlag(X86Flags.CF, ((src >> bit) & 1) != 0);
+                    src |= 1UL << bit;
+                    if (inst.Mod == 3) { if (inst.RexW) state.SetGpr(inst.RM, src); else state.SetGpr32(inst.RM, (uint)src); }
+                    else { if (inst.RexW) mem.WriteUInt64(addr, src); else mem.WriteUInt32(addr, (uint)src); }
+                    return 0;
+                }
+
+                // BTR r/m, r (0F B3) — bit test and reset
+                case 0xB3:
+                {
+                    ulong src;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); src = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr); }
+                    int bit = (int)(state.GetGpr(inst.Reg) & (inst.RexW ? 63UL : 31UL));
+                    state.SetFlag(X86Flags.CF, ((src >> bit) & 1) != 0);
+                    src &= ~(1UL << bit);
+                    if (inst.Mod == 3) { if (inst.RexW) state.SetGpr(inst.RM, src); else state.SetGpr32(inst.RM, (uint)src); }
+                    else { if (inst.RexW) mem.WriteUInt64(addr, src); else mem.WriteUInt32(addr, (uint)src); }
+                    return 0;
+                }
+
+                // BTC r/m, r (0F BB) — bit test and complement
+                case 0xBB:
+                {
+                    ulong src;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); src = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr); }
+                    int bit = (int)(state.GetGpr(inst.Reg) & (inst.RexW ? 63UL : 31UL));
+                    state.SetFlag(X86Flags.CF, ((src >> bit) & 1) != 0);
+                    src ^= 1UL << bit;
+                    if (inst.Mod == 3) { if (inst.RexW) state.SetGpr(inst.RM, src); else state.SetGpr32(inst.RM, (uint)src); }
+                    else { if (inst.RexW) mem.WriteUInt64(addr, src); else mem.WriteUInt32(addr, (uint)src); }
+                    return 0;
+                }
+
+                // BT/BTS/BTR/BTC r/m, imm8 (0F BA /4-/7)
+                case 0xBA:
+                {
+                    int subOp = (inst.ModRM >> 3) & 7;
+                    ulong src;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); src = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr); }
+                    int bit = (int)(inst.Immediate & (inst.RexW ? 63 : 31));
+                    state.SetFlag(X86Flags.CF, ((src >> bit) & 1) != 0);
+                    if (subOp == 5) src |= 1UL << bit;        // BTS
+                    else if (subOp == 6) src &= ~(1UL << bit); // BTR
+                    else if (subOp == 7) src ^= 1UL << bit;    // BTC
+                    // subOp == 4 is plain BT, no modification
+                    if (subOp >= 5)
+                    {
+                        if (inst.Mod == 3) { if (inst.RexW) state.SetGpr(inst.RM, src); else state.SetGpr32(inst.RM, (uint)src); }
+                        else { if (inst.RexW) mem.WriteUInt64(addr, src); else mem.WriteUInt32(addr, (uint)src); }
+                    }
+                    return 0;
+                }
+
+                // XADD r/m, r (0F C1)
+                case 0xC1:
+                {
+                    ulong a, b = state.GetGpr(inst.Reg);
+                    if (inst.Mod == 3)
+                    {
+                        a = state.GetGpr(inst.RM);
+                        ulong sum = inst.RexW ? DoAlu64(0, a, b, state) : DoAlu32(0, (uint)a, (uint)b, state);
+                        state.SetGpr(inst.Reg, a);
+                        if (inst.RexW) state.SetGpr(inst.RM, sum); else state.SetGpr32(inst.RM, (uint)sum);
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        a = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr);
+                        ulong sum = inst.RexW ? DoAlu64(0, a, b, state) : DoAlu32(0, (uint)a, (uint)b, state);
+                        state.SetGpr(inst.Reg, a);
+                        if (inst.RexW) mem.WriteUInt64(addr, sum); else mem.WriteUInt32(addr, (uint)sum);
+                    }
+                    return 0;
+                }
+
+                // XADD r/m8, r8 (0F C0)
+                case 0xC0:
+                {
+                    byte a, b = (byte)state.GetGpr(inst.Reg);
+                    if (inst.Mod == 3)
+                    {
+                        a = (byte)state.GetGpr(inst.RM);
+                        byte sum = DoAlu8(0, a, b, state);
+                        SetRegByte(state, inst.Reg, inst.HasRex, a);
+                        SetRegByte(state, inst.RM, inst.HasRex, sum);
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        a = mem.ReadByte(addr);
+                        byte sum = DoAlu8(0, a, b, state);
+                        SetRegByte(state, inst.Reg, inst.HasRex, a);
+                        mem.WriteByte(addr, sum);
+                    }
+                    return 0;
+                }
+
+                // CMPXCHG r/m, r (0F B1 — 32/64-bit)
+                case 0xB1:
+                {
+                    ulong comparand = inst.RexW ? state.RAX : state.EAX;
+                    ulong dest;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) dest = state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); dest = inst.RexW ? mem.ReadUInt64(addr) : mem.ReadUInt32(addr); }
+
+                    if (dest == comparand)
+                    {
+                        state.SetFlag(X86Flags.ZF, true);
+                        ulong src = state.GetGpr(inst.Reg);
+                        if (inst.Mod == 3) { if (inst.RexW) state.SetGpr(inst.RM, src); else state.SetGpr32(inst.RM, (uint)src); }
+                        else { if (inst.RexW) mem.WriteUInt64(addr, src); else mem.WriteUInt32(addr, (uint)src); }
+                    }
+                    else
+                    {
+                        state.SetFlag(X86Flags.ZF, false);
+                        if (inst.RexW) state.RAX = dest; else state.EAX = (uint)dest;
+                    }
+                    return 0;
+                }
+
+                // CMPXCHG r/m8, r8 (0F B0)
+                case 0xB0:
+                {
+                    byte comparand = state.AL;
+                    byte dest;
+                    ulong addr = 0;
+                    if (inst.Mod == 3) dest = (byte)state.GetGpr(inst.RM);
+                    else { addr = ComputeEffectiveAddress(inst, state, mem, nextAddr); dest = mem.ReadByte(addr); }
+
+                    if (dest == comparand)
+                    {
+                        state.SetFlag(X86Flags.ZF, true);
+                        byte src = (byte)state.GetGpr(inst.Reg);
+                        if (inst.Mod == 3) SetRegByte(state, inst.RM, inst.HasRex, src);
+                        else mem.WriteByte(addr, src);
+                    }
+                    else
+                    {
+                        state.SetFlag(X86Flags.ZF, false);
+                        state.AL = dest;
+                    }
+                    return 0;
+                }
+
+                // BSWAP (0F C8+rd) — byte swap
+                case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+                case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+                {
+                    int reg = (second - 0xC8) | (inst.RexB ? 8 : 0);
+                    if (inst.RexW)
+                    {
+                        ulong val = state.GetGpr(reg);
+                        val = ((val & 0xFF00000000000000UL) >> 56) |
+                              ((val & 0x00FF000000000000UL) >> 40) |
+                              ((val & 0x0000FF0000000000UL) >> 24) |
+                              ((val & 0x000000FF00000000UL) >> 8) |
+                              ((val & 0x00000000FF000000UL) << 8) |
+                              ((val & 0x0000000000FF0000UL) << 24) |
+                              ((val & 0x000000000000FF00UL) << 40) |
+                              ((val & 0x00000000000000FFUL) << 56);
+                        state.SetGpr(reg, val);
+                    }
+                    else
+                    {
+                        uint val = (uint)state.GetGpr(reg);
+                        val = ((val >> 24) & 0xFF) |
+                              ((val >> 8) & 0xFF00) |
+                              ((val << 8) & 0xFF0000) |
+                              ((val << 24) & 0xFF000000);
+                        state.SetGpr32(reg, val);
+                    }
+                    return 0;
+                }
+
+                // POPCNT (F3 0F B8)
+                case 0xB8:
+                {
+                    ulong src;
+                    if (inst.Mod == 3) src = state.GetGpr(inst.RM);
+                    else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                    int count = 0;
+                    ulong tmp = src;
+                    while (tmp != 0) { count += (int)(tmp & 1); tmp >>= 1; }
+                    if (inst.RexW) state.SetGpr(inst.Reg, (ulong)count);
+                    else state.SetGpr32(inst.Reg, (uint)count);
+                    state.SetFlag(X86Flags.ZF, src == 0);
+                    state.SetFlag(X86Flags.CF, false);
+                    state.SetFlag(X86Flags.OF, false);
+                    state.SetFlag(X86Flags.SF, false);
+                    state.SetFlag(X86Flags.PF, false);
+                    return 0;
+                }
 
                 default:
                     return 0;

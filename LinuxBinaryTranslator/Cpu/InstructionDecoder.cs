@@ -403,6 +403,91 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // MOVSX/MOVZX are two-byte (0F BE/BF/B6/B7) — handled below
 
+                // MOVSXD r64, r/m32 (0x63 with REX.W) — critical for sign-extending
+                // 32-bit values to 64-bit, very common in static binaries
+                case 0x63:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // XCHG r8, r/m8 (86)
+                case 0x86:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // MOV moffs (A0-A3): direct memory address encoding
+                case 0xA0: // MOV AL, moffs8
+                    if (inst.RexW || !operandOverride)
+                    {
+                        inst.Immediate = (long)_memory.ReadUInt64(pos);
+                        inst.ImmediateSize = 8;
+                        pos += 8;
+                    }
+                    else
+                    {
+                        inst.Immediate = (int)_memory.ReadUInt32(pos);
+                        inst.ImmediateSize = 4;
+                        pos += 4;
+                    }
+                    break;
+                case 0xA1: // MOV RAX/EAX, moffs
+                    if (inst.RexW || !operandOverride)
+                    {
+                        inst.Immediate = (long)_memory.ReadUInt64(pos);
+                        inst.ImmediateSize = 8;
+                        pos += 8;
+                    }
+                    else
+                    {
+                        inst.Immediate = (int)_memory.ReadUInt32(pos);
+                        inst.ImmediateSize = 4;
+                        pos += 4;
+                    }
+                    break;
+                case 0xA2: // MOV moffs8, AL
+                    if (inst.RexW || !operandOverride)
+                    {
+                        inst.Immediate = (long)_memory.ReadUInt64(pos);
+                        inst.ImmediateSize = 8;
+                        pos += 8;
+                    }
+                    else
+                    {
+                        inst.Immediate = (int)_memory.ReadUInt32(pos);
+                        inst.ImmediateSize = 4;
+                        pos += 4;
+                    }
+                    break;
+                case 0xA3: // MOV moffs, RAX/EAX
+                    if (inst.RexW || !operandOverride)
+                    {
+                        inst.Immediate = (long)_memory.ReadUInt64(pos);
+                        inst.ImmediateSize = 8;
+                        pos += 8;
+                    }
+                    else
+                    {
+                        inst.Immediate = (int)_memory.ReadUInt32(pos);
+                        inst.ImmediateSize = 4;
+                        pos += 4;
+                    }
+                    break;
+
+                // CMPSB/CMPSQ (A6/A7) — compare string bytes/qwords
+                case 0xA6: case 0xA7:
+                    break;
+
+                // BT/BTS/BTR/BTC group (0F BA with ModRM) — bit test with immediate
+                // Handled in two-byte section
+
+                // ENTER (C8) — create stack frame
+                case 0xC8:
+                    inst.Immediate = _memory.ReadUInt16(pos);
+                    inst.ImmediateSize = 2;
+                    pos += 2;
+                    // Nesting level byte
+                    pos += 1;
+                    break;
+
                 // HLT (F4) - should not appear in user code
                 case 0xF4:
                     inst.IsTerminator = true;
@@ -508,6 +593,28 @@ namespace LinuxBinaryTranslator.Cpu
                 // RDTSC (0F 31)
                 case 0x31:
                     break;
+
+                // BT/BTS/BTR/BTC r/m, imm8 (0F BA /4-/7)
+                case 0xBA:
+                    DecodeModRM(inst, ref pos);
+                    inst.Immediate = _memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    break;
+
+                // BSWAP (0F C8+rd)
+                case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+                case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+                    break;
+
+                // MOVSX r, r/m32 (0F 63 — MOVSXD in 64-bit mode handled as one-byte 0x63)
+                // POPCNT (F3 0F B8) — population count
+                case 0xB8:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // LZCNT/TZCNT (F3 0F BD / F3 0F BC) — leading/trailing zero count
+                // Already handled as BSF/BSR above
 
                 default:
                     break;
