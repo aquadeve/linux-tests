@@ -5,7 +5,7 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     mc:Ignorable="d"
-    Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+    Background="Black"
     KeyDown="Page_KeyDown">
 
     <Grid>
@@ -28,17 +28,18 @@
             </Grid.ColumnDefinitions>
             <TextBlock Grid.Column="0"
                        Text="Linux Binary Translator"
-                       Style="{ThemeResource SubtitleTextBlockStyle}"
+                       FontSize="24"
+                       Foreground="White"
                        VerticalAlignment="Center"/>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
                 <Button x:Name="LoadButton"
                         Content="Load ELF Binary"
                         Click="LoadButton_Click"
-                        XYFocusDown="{x:Bind InputBox}"/>
+                        Margin="0,0,8,0"/>
                 <Button x:Name="BootRootfsButton"
                         Content="Boot Rootfs"
                         Click="BootRootfsButton_Click"
-                        XYFocusDown="{x:Bind InputBox}"/>
+                        Margin="0,0,8,0"/>
                 <Button x:Name="StopButton"
                         Content="Stop"
                         Click="StopButton_Click"
@@ -54,7 +55,7 @@
                       HorizontalScrollBarVisibility="Auto"
                       Background="#FF1E1E1E">
             <TextBlock x:Name="OutputTextBlock"
-                       FontFamily="Consolas, Courier New, monospace"
+                       FontFamily="Consolas"
                        FontSize="14"
                        Foreground="#FFCCCCCC"
                        IsTextSelectionEnabled="True"
@@ -81,9 +82,10 @@
                      Grid.Column="1"
                      FontFamily="Consolas"
                      FontSize="14"
+                     Foreground="White"
+                     Background="#FF222222"
                      PlaceholderText="Type input here..."
-                     KeyDown="InputBox_KeyDown"
-                     XYFocusUp="{x:Bind OutputScrollViewer}"/>
+                     KeyDown="InputBox_KeyDown"/>
             <Button Grid.Column="2"
                     Content="Send"
                     Click="SendButton_Click"

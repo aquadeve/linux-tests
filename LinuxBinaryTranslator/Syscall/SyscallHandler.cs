@@ -10,6 +10,7 @@
 //   RAX = return value (negative errno on error)
 
 using System;
+using System.Collections.Generic;
 using System.Text;
 using LinuxBinaryTranslator.Cpu;
 using LinuxBinaryTranslator.FileSystem;
@@ -679,12 +680,14 @@ namespace LinuxBinaryTranslator.Syscall
             switch (code)
             {
                 case ArchPrctlCmd.ARCH_SET_FS:
+                    _logger($"arch_prctl(ARCH_SET_FS, 0x{addr:X16})");
                     state.FSBase = addr;
                     return 0;
                 case ArchPrctlCmd.ARCH_GET_FS:
                     _memory.WriteUInt64(addr, state.FSBase);
                     return 0;
                 case ArchPrctlCmd.ARCH_SET_GS:
+                    _logger($"arch_prctl(ARCH_SET_GS, 0x{addr:X16})");
                     state.GSBase = addr;
                     return 0;
                 case ArchPrctlCmd.ARCH_GET_GS:
@@ -999,7 +1002,9 @@ namespace LinuxBinaryTranslator.Syscall
                 string target = "/usr/bin/program";
                 byte[] data = Encoding.UTF8.GetBytes(target);
                 int len = (int)Math.Min((ulong)data.Length, bufSize);
-                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                byte[] slice = new byte[len];
+                Array.Copy(data, 0, slice, 0, len);
+                _memory.Write(bufAddr, slice);
                 return len;
             }
             // Handle /proc/self/fd/N
@@ -1008,7 +1013,9 @@ namespace LinuxBinaryTranslator.Syscall
                 string target = "/dev/fd/" + path.Substring(14);
                 byte[] data = Encoding.UTF8.GetBytes(target);
                 int len = (int)Math.Min((ulong)data.Length, bufSize);
-                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                byte[] slice = new byte[len];
+                Array.Copy(data, 0, slice, 0, len);
+                _memory.Write(bufAddr, slice);
                 return len;
             }
             // Check rootfs symlinks
@@ -1017,7 +1024,9 @@ namespace LinuxBinaryTranslator.Syscall
             {
                 byte[] data = Encoding.UTF8.GetBytes(symlinkTarget);
                 int len = (int)Math.Min((ulong)data.Length, bufSize);
-                _memory.Write(bufAddr, data.AsSpan(0, len).ToArray());
+                byte[] slice = new byte[len];
+                Array.Copy(data, 0, slice, 0, len);
+                _memory.Write(bufAddr, slice);
                 return len;
             }
             return -Errno.EINVAL;
@@ -1074,8 +1083,7 @@ namespace LinuxBinaryTranslator.Syscall
                     uint current = _memory.ReadUInt32(uaddr);
                     if (current != val)
                         return -Errno.EAGAIN;
-                    // For single-threaded: just yield and return
-                    System.Threading.Thread.Yield();
+                    // Single-threaded emulation has nothing to block on here.
                     return 0;
                 }
                 case FUTEX_WAKE:

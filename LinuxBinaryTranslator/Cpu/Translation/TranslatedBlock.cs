@@ -76,6 +76,7 @@ namespace LinuxBinaryTranslator.Cpu.Translation
         public bool HasOperandOverride { get; set; } // 66 — operand size override
         public bool HasAddressOverride { get; set; } // 67 — address size override
 
+        public byte SegmentOverridePrefix { get; set; }
         public byte[] Opcode { get; set; } = Array.Empty<byte>();
         public byte ModRM { get; set; }
         public bool HasModRM { get; set; }

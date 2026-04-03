@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Text;
 using LinuxBinaryTranslator.Cpu.Translation;
 using LinuxBinaryTranslator.Memory;
 
@@ -54,6 +55,43 @@ namespace LinuxBinaryTranslator.Cpu
         public void InvalidateCache()
         {
             _cache.Clear();
+        }
+
+        /// <summary>
+        /// Best-effort diagnostic dump of a decoded block.
+        /// </summary>
+        public string DescribeBlock(ulong startAddress, int maxInstructions = 8)
+        {
+            var sb = new StringBuilder();
+            ulong addr = startAddress;
+
+            for (int i = 0; i < maxInstructions && _memory.IsMapped(addr); i++)
+            {
+                var inst = _decoder.Decode(addr);
+                if (inst.Length <= 0)
+                    break;
+
+                if (sb.Length > 0)
+                    sb.Append(" | ");
+
+                sb.Append($"0x{addr:X16}: {FormatBytes(_memory.Read(addr, (ulong)inst.Length))} len={inst.Length} op={FormatOpcode(inst.Opcode)}");
+                if (inst.HasModRM)
+                    sb.Append($" modrm={inst.ModRM:X2}");
+                if (inst.DisplacementSize != 0)
+                    sb.Append($" disp={inst.Displacement}");
+                if (inst.ImmediateSize != 0)
+                    sb.Append($" imm=0x{unchecked((ulong)inst.Immediate):X}");
+                if (inst.IsTerminator)
+                    sb.Append(" term");
+                if (inst.IsSyscall)
+                    sb.Append(" syscall");
+
+                addr += (ulong)inst.Length;
+                if (inst.IsTerminator || inst.IsSyscall)
+                    break;
+            }
+
+            return sb.ToString();
         }
 
         /// <summary>
@@ -374,14 +412,18 @@ namespace LinuxBinaryTranslator.Cpu
                     return 0;
                 }
 
-                // ALU operations: ADD (00-05), OR (08-0D), AND (20-25), SUB (28-2D), XOR (30-35), CMP (38-3D)
+                // ALU operations: ADD/ADC/SBB/OR/AND/SUB/XOR/CMP
                 case 0x01: case 0x09: case 0x21: case 0x29: case 0x31: case 0x39:
+                case 0x11: case 0x19:
                     return ExecuteAluRmR(inst, opcode, state, mem, nextAddr, false);
                 case 0x03: case 0x0B: case 0x23: case 0x2B: case 0x33: case 0x3B:
+                case 0x13: case 0x1B:
                     return ExecuteAluRRm(inst, opcode, state, mem, nextAddr, false);
                 case 0x00: case 0x08: case 0x20: case 0x28: case 0x30: case 0x38:
+                case 0x10: case 0x18:
                     return ExecuteAluRmR(inst, opcode, state, mem, nextAddr, true);
                 case 0x02: case 0x0A: case 0x22: case 0x2A: case 0x32: case 0x3A:
+                case 0x12: case 0x1A:
                     return ExecuteAluRRm(inst, opcode, state, mem, nextAddr, true);
 
                 // ALU AL/RAX, imm
@@ -959,6 +1001,11 @@ namespace LinuxBinaryTranslator.Cpu
 
             switch (second)
             {
+                // ENDBR64 / ENDBR32 (CET indirect branch landing pads)
+                // These are no-ops for our emulator but must decode as 4 bytes.
+                case 0x1E:
+                    return 0;
+
                 // Jcc rel32 (0F 80-8F)
                 case 0x80: case 0x81: case 0x82: case 0x83:
                 case 0x84: case 0x85: case 0x86: case 0x87:
@@ -1358,6 +1405,9 @@ namespace LinuxBinaryTranslator.Cpu
                 // POPCNT (F3 0F B8)
                 case 0xB8:
                 {
+                    if (!inst.HasRepPrefix)
+                        return 0;
+
                     ulong src;
                     if (inst.Mod == 3) src = state.GetGpr(inst.RM);
                     else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
@@ -2055,7 +2105,9 @@ namespace LinuxBinaryTranslator.Cpu
                 default:
                     return 0;
             }
-        }(DecodedInstruction inst, byte opcode, CpuState state, VirtualMemoryManager mem, ulong nextAddr, bool byte_op)
+        }
+
+        private ulong ExecuteAluRmR(DecodedInstruction inst, byte opcode, CpuState state, VirtualMemoryManager mem, ulong nextAddr, bool byte_op)
         {
             int aluOp = (opcode >> 3) & 7;
             if (byte_op)
@@ -2251,10 +2303,13 @@ namespace LinuxBinaryTranslator.Cpu
         {
             int regOp = (inst.ModRM >> 3) & 7;
             ulong operand;
+            bool force64Operand = regOp == 2 || regOp == 4 || regOp == 6;
             if (inst.Mod == 3)
                 operand = state.GetGpr(inst.RM);
             else
-                operand = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                operand = (inst.RexW || force64Operand)
+                    ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr))
+                    : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
 
             switch (regOp)
             {
@@ -2539,7 +2594,7 @@ namespace LinuxBinaryTranslator.Cpu
                 case 3: // SBB
                     ulong borrow = state.GetFlag(X86Flags.CF) ? 1UL : 0;
                     result = a - b - borrow;
-                    state.SetFlag(X86Flags.CF, a < b + borrow);
+                    state.SetFlag(X86Flags.CF, borrow != 0 ? a <= b : a < b);
                     state.SetFlag(X86Flags.OF, ((a ^ b) & (a ^ result) & 0x8000000000000000UL) != 0);
                     break;
                 case 4: // AND
@@ -2579,7 +2634,7 @@ namespace LinuxBinaryTranslator.Cpu
                 case 0: result = a + b; state.SetFlag(X86Flags.CF, result < a); state.SetFlag(X86Flags.OF, ((a ^ result) & (b ^ result) & 0x80000000U) != 0); break;
                 case 1: result = a | b; state.SetFlag(X86Flags.CF, false); state.SetFlag(X86Flags.OF, false); break;
                 case 2: { uint c = state.GetFlag(X86Flags.CF) ? 1U : 0; result = a + b + c; state.SetFlag(X86Flags.CF, (c != 0 && result <= a) || (c == 0 && result < a)); state.SetFlag(X86Flags.OF, ((a ^ result) & (b ^ result) & 0x80000000U) != 0); break; }
-                case 3: { uint c = state.GetFlag(X86Flags.CF) ? 1U : 0; result = a - b - c; state.SetFlag(X86Flags.CF, a < b + c); state.SetFlag(X86Flags.OF, ((a ^ b) & (a ^ result) & 0x80000000U) != 0); break; }
+                case 3: { uint c = state.GetFlag(X86Flags.CF) ? 1U : 0; result = a - b - c; state.SetFlag(X86Flags.CF, c != 0 ? a <= b : a < b); state.SetFlag(X86Flags.OF, ((a ^ b) & (a ^ result) & 0x80000000U) != 0); break; }
                 case 4: result = a & b; state.SetFlag(X86Flags.CF, false); state.SetFlag(X86Flags.OF, false); break;
                 case 5: result = a - b; state.SetFlag(X86Flags.CF, a < b); state.SetFlag(X86Flags.OF, ((a ^ b) & (a ^ result) & 0x80000000U) != 0); break;
                 case 6: result = a ^ b; state.SetFlag(X86Flags.CF, false); state.SetFlag(X86Flags.OF, false); break;
@@ -2736,7 +2791,44 @@ namespace LinuxBinaryTranslator.Cpu
                     addr += (ulong)(long)inst.Displacement;
             }
 
-            return addr;
+            return ApplySegmentBase(inst, state, addr);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong ApplySegmentBase(DecodedInstruction inst, CpuState state, ulong address)
+        {
+            return inst.SegmentOverridePrefix switch
+            {
+                0x64 => state.FSBase + address, // FS
+                0x65 => state.GSBase + address, // GS
+                _ => address,
+            };
+        }
+
+        private static string FormatBytes(byte[] bytes)
+        {
+            if (bytes.Length == 0)
+                return "<empty>";
+
+            var sb = new StringBuilder(bytes.Length * 3 - 1);
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                if (i != 0)
+                    sb.Append(' ');
+                sb.Append(bytes[i].ToString("X2"));
+            }
+            return sb.ToString();
+        }
+
+        private static string FormatOpcode(byte[] opcode)
+        {
+            if (opcode.Length == 0)
+                return "<none>";
+
+            var sb = new StringBuilder(opcode.Length * 2);
+            for (int i = 0; i < opcode.Length; i++)
+                sb.Append(opcode[i].ToString("X2"));
+            return sb.ToString();
         }
 
         // === Helper: set byte register ===

@@ -215,19 +215,7 @@ namespace LinuxBinaryTranslator.FileSystem
         public byte[]? ReadFile(string path)
         {
             path = NormalizePath(path);
-
-            // Follow symlinks
-            if (_symlinks.TryGetValue(path, out string? target))
-            {
-                string resolved = ResolveSymlink(path, target);
-                if (_files.TryGetValue(resolved, out var linkData))
-                    return linkData;
-            }
-
-            if (_files.TryGetValue(path, out var data))
-                return data;
-
-            return null;
+            return TryResolveFile(path, 0);
         }
 
         /// <summary>
@@ -291,6 +279,23 @@ namespace LinuxBinaryTranslator.FileSystem
         {
             path = NormalizePath(path);
             return _symlinks.TryGetValue(path, out string? target) ? target : null;
+        }
+
+        private byte[]? TryResolveFile(string path, int depth)
+        {
+            if (depth > 16)
+                return null;
+
+            if (_files.TryGetValue(path, out var data))
+                return data;
+
+            if (_symlinks.TryGetValue(path, out string? target))
+            {
+                string resolved = ResolveSymlink(path, target);
+                return TryResolveFile(resolved, depth + 1);
+            }
+
+            return null;
         }
 
         /// <summary>

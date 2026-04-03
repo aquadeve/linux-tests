@@ -38,6 +38,7 @@ namespace LinuxBinaryTranslator.Cpu
             bool hasAddressOverride = false;
             bool hasRepPrefix = false;
             bool hasRepnePrefix = false;
+            byte segmentOverridePrefix = 0;
 
             while (true)
             {
@@ -50,7 +51,10 @@ namespace LinuxBinaryTranslator.Cpu
                     case 0xF2: hasRepnePrefix = true; pos++; continue;
                     case 0xF3: hasRepPrefix = true; pos++; continue;
                     case 0x2E: case 0x3E: case 0x26: case 0x64:
-                    case 0x65: case 0x36: pos++; continue; // Segment override prefixes
+                    case 0x65: case 0x36:
+                        segmentOverridePrefix = b;
+                        pos++;
+                        continue; // Segment override prefixes
                 }
                 break;
             }
@@ -67,6 +71,13 @@ namespace LinuxBinaryTranslator.Cpu
                 pos++;
                 current = _memory.ReadByte(pos);
             }
+
+            // Make prefix state available to opcode-specific decode logic.
+            inst.HasRepPrefix = hasRepPrefix;
+            inst.HasRepnePrefix = hasRepnePrefix;
+            inst.HasOperandOverride = hasOperandOverride;
+            inst.HasAddressOverride = hasAddressOverride;
+            inst.SegmentOverridePrefix = segmentOverridePrefix;
 
             // === Opcode ===
             if (current == 0x0F)
@@ -85,10 +96,6 @@ namespace LinuxBinaryTranslator.Cpu
             }
 
             inst.Length = (int)(pos - address);
-            inst.HasRepPrefix = hasRepPrefix;
-            inst.HasRepnePrefix = hasRepnePrefix;
-            inst.HasOperandOverride = hasOperandOverride;
-            inst.HasAddressOverride = hasAddressOverride;
             return inst;
         }
 
@@ -198,6 +205,10 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // ADD r/m, r (01) / ADD r, r/m (03)
                 case 0x00: case 0x01: case 0x02: case 0x03:
+                // ADC r/m, r (11) / ADC r, r/m (13)
+                case 0x10: case 0x11: case 0x12: case 0x13:
+                // SBB r/m, r (19) / SBB r, r/m (1B)
+                case 0x18: case 0x19: case 0x1A: case 0x1B:
                 // OR r/m, r (09) / OR r, r/m (0B)
                 case 0x08: case 0x09: case 0x0A: case 0x0B:
                 // AND r/m, r (21) / AND r, r/m (23)
@@ -413,11 +424,6 @@ namespace LinuxBinaryTranslator.Cpu
                     DecodeModRM(inst, ref pos);
                     break;
 
-                // XCHG r8, r/m8 (86)
-                case 0x86:
-                    DecodeModRM(inst, ref pos);
-                    break;
-
                 // MOV moffs (A0-A3): direct memory address encoding
                 case 0xA0: // MOV AL, moffs8
                     if (inst.RexW || !operandOverride)
@@ -607,6 +613,12 @@ namespace LinuxBinaryTranslator.Cpu
                     DecodeModRM(inst, ref pos);
                     break;
 
+                // ENDBR64 / ENDBR32 (F3 0F 1E FA / F3 0F 1E FB)
+                // Decode the ModRM byte so instruction length stays correct.
+                case 0x1E:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
                 // NOP (0F 1F /0) - multi-byte NOP
                 case 0x1F:
                     DecodeModRM(inst, ref pos);
@@ -641,7 +653,16 @@ namespace LinuxBinaryTranslator.Cpu
                 // MOVSX r, r/m32 (0F 63 — MOVSXD in 64-bit mode handled as one-byte 0x63)
                 // POPCNT (F3 0F B8) — population count
                 case 0xB8:
-                    DecodeModRM(inst, ref pos);
+                    if (inst.HasRepPrefix)
+                    {
+                        DecodeModRM(inst, ref pos);
+                    }
+                    else
+                    {
+                        inst.Immediate = (int)_memory.ReadUInt32(pos);
+                        inst.ImmediateSize = 4;
+                        pos += 4;
+                    }
                     break;
 
                 // LZCNT/TZCNT (F3 0F BD / F3 0F BC) — leading/trailing zero count
@@ -787,11 +808,6 @@ namespace LinuxBinaryTranslator.Cpu
                     DecodeModRM(inst, ref pos);
                     break;
 
-                // MINPS/MINSS/MINPD/MINSD (0F 5D), MAXPS/MAXSS/MAXPD/MAXSD (0F 5F)
-                case 0x5D: case 0x5F:
-                    DecodeModRM(inst, ref pos);
-                    break;
-
                 // PMOVMSKB (66 0F D7)
                 case 0xD7:
                     DecodeModRM(inst, ref pos);
@@ -804,16 +820,6 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // PAVGB (66 0F E0), PAVGW (66 0F E3)
                 case 0xE0: case 0xE3:
-                    DecodeModRM(inst, ref pos);
-                    break;
-
-                // CVTPS2PD (0F 5A), CVTPD2PS (66 0F 5A), CVTSS2SD (F3 0F 5A), CVTSD2SS (F2 0F 5A)
-                case 0x5A:
-                    DecodeModRM(inst, ref pos);
-                    break;
-
-                // CVTDQ2PS (0F 5B), CVTTPS2DQ (F3 0F 5B), CVTPS2DQ (66 0F 5B)
-                case 0x5B:
                     DecodeModRM(inst, ref pos);
                     break;
 

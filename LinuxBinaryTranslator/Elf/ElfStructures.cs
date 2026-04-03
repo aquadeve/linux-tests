@@ -122,7 +122,9 @@ namespace LinuxBinaryTranslator.Elf
         public const ulong AT_PLATFORM = 15;
         public const ulong AT_HWCAP = 16;
         public const ulong AT_CLKTCK = 17;
+        public const ulong AT_SECURE = 23;
         public const ulong AT_RANDOM = 25;
+        public const ulong AT_EXECFN = 31;
     }
 
     /// <summary>

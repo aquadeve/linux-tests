@@ -6,6 +6,7 @@
 // the ELF loader, block translator, syscall handler, and VFS.
 
 using System;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -168,12 +169,13 @@ namespace LinuxBinaryTranslator
             var startTime = DateTime.UtcNow;
             long blocksExecuted = 0;
             string? error = null;
+            var recentBlocks = new Queue<ulong>();
 
             try
             {
-                await Task.Run(() =>
+                await Task.Run(async () =>
                 {
-                    while (!_cpu.Halted && !cancellationToken.IsCancellationRequested)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
                         // Check for pending execve request
                         ExecveRequest? execReq = _syscallHandler.PendingExecve;
@@ -183,6 +185,9 @@ namespace LinuxBinaryTranslator
                             HandleExecve(execReq);
                             continue; // Start executing the new binary
                         }
+
+                        if (_cpu.Halted)
+                            break;
 
                         // Check for pending signals at safe points
                         if (_syscallHandler.DeliverPendingSignal(_cpu, _memory))
@@ -196,6 +201,7 @@ namespace LinuxBinaryTranslator
                         {
                             // Try to deliver SIGSEGV before terminating
                             _logger($"Execution fault: RIP=0x{_cpu.RIP:X16} is not in mapped memory");
+                            _logger($"Registers: RSP=0x{_cpu.RSP:X16}, RBP=0x{_cpu.RBP:X16}, RAX=0x{_cpu.RAX:X16}, RBX=0x{_cpu.RBX:X16}, RCX=0x{_cpu.RCX:X16}, RDX=0x{_cpu.RDX:X16}, RSI=0x{_cpu.RSI:X16}, RDI=0x{_cpu.RDI:X16}");
                             _syscallHandler.QueueSignal(11); // SIGSEGV
                             if (_syscallHandler.DeliverPendingSignal(_cpu, _memory))
                             {
@@ -208,17 +214,30 @@ namespace LinuxBinaryTranslator
                         }
 
                         var block = _translator.GetBlock(_cpu.RIP);
+                        recentBlocks.Enqueue(block.Address);
+                        while (recentBlocks.Count > 8)
+                            recentBlocks.Dequeue();
+
                         block.ExecutionCount++;
                         blocksExecuted++;
 
                         ulong nextAddr = block.Execute(_cpu, _memory);
+
+                        if (!_cpu.Halted && nextAddr != 0 && !_memory.IsMapped(nextAddr))
+                        {
+                            _logger($"Control transfer fault: block 0x{block.Address:X16} -> 0x{nextAddr:X16}");
+                            _logger($"Block bytes: {FormatBytes(_memory.Read(block.Address, 16))}");
+                            _logger($"Decoded block: {_translator.DescribeBlock(block.Address)}");
+                            _logger($"Recent blocks: {FormatRecentBlocks(recentBlocks)}");
+                            _logger($"Decoded recent blocks: {DescribeRecentBlocks(recentBlocks)}");
+                        }
 
                         if (!_cpu.Halted && nextAddr != 0)
                             _cpu.RIP = nextAddr;
 
                         // Safety: check for infinite loops with a yield point
                         if (blocksExecuted % 100000 == 0)
-                            Thread.Yield();
+                            await Task.Yield();
                     }
                 }, cancellationToken);
             }
@@ -266,18 +285,15 @@ namespace LinuxBinaryTranslator
 
             try
             {
-                // Load the new binary
-                var loader = new ElfLoader(_memory);
-                var loadResult = loader.Load(request.ElfData);
+                // Keep /proc/self in sync with the new process image.
+                _vfs.Mount("/proc/self/exe", () => new FileSystem.MemoryFile(
+                    Encoding.UTF8.GetBytes(request.Path)));
+                _vfs.Mount("/proc/self/cmdline", () => new FileSystem.MemoryFile(
+                    Encoding.UTF8.GetBytes(string.Join("\0", request.Argv) + "\0")));
 
-                _memory.InitializeBrk(loadResult.BrkAddress);
-
-                // Set up the stack with new argv/envp
-                SetupStack(loadResult, request.Argv, request.Envp);
-
-                // Jump to the new entry point
-                _cpu.RIP = loadResult.EntryPoint;
-
+                // Reuse the normal binary loading path so PT_INTERP binaries
+                // also load their dynamic linker during execve.
+                var loadResult = LoadBinary(request.ElfData, request.Argv, request.Envp);
                 _logger($"execve: entry=0x{loadResult.EntryPoint:X16}, " +
                         $"segments={loadResult.Segments.Count}");
             }
@@ -391,6 +407,7 @@ namespace LinuxBinaryTranslator
 
             // Align to 16 bytes
             sp &= ~0xFUL;
+            ulong execfnAddr = argvPtrs.Length > 0 ? argvPtrs[0] : 0;
 
             // Auxiliary vector (from bottom up)
             // We'll build from top down, then copy
@@ -408,8 +425,10 @@ namespace LinuxBinaryTranslator
                 (ElfConstants.AT_GID, 1000),
                 (ElfConstants.AT_EGID, 1000),
                 (ElfConstants.AT_CLKTCK, 100),
+                (ElfConstants.AT_SECURE, 0),
                 (ElfConstants.AT_PLATFORM, platformAddr),
                 (ElfConstants.AT_RANDOM, randomAddr),
+                (ElfConstants.AT_EXECFN, execfnAddr),
                 (ElfConstants.AT_NULL, 0),
             };
 
@@ -502,6 +521,7 @@ namespace LinuxBinaryTranslator
             _memory.Write(platformAddr, platformStr);
 
             sp &= ~0xFUL;
+            ulong execfnAddr = argvPtrs.Length > 0 ? argvPtrs[0] : 0;
 
             // Auxiliary vector — AT_ENTRY is the real binary entry, AT_BASE is interpreter base
             var auxv = new (ulong type, ulong value)[]
@@ -518,8 +538,10 @@ namespace LinuxBinaryTranslator
                 (ElfConstants.AT_GID, 1000),
                 (ElfConstants.AT_EGID, 1000),
                 (ElfConstants.AT_CLKTCK, 100),
+                (ElfConstants.AT_SECURE, 0),
                 (ElfConstants.AT_PLATFORM, platformAddr),
                 (ElfConstants.AT_RANDOM, randomAddr),
+                (ElfConstants.AT_EXECFN, execfnAddr),
                 (ElfConstants.AT_NULL, 0),
             };
 
@@ -558,7 +580,8 @@ namespace LinuxBinaryTranslator
             }
 
             _logger($"Stack set up (with interp): RSP=0x{_cpu.RSP:X16}, " +
-                    $"argc={argv.Length}, AT_ENTRY=0x{realEntry:X16}, AT_BASE=0x{interpBase:X16}");
+                    $"argc={argv.Length}, AT_ENTRY=0x{realEntry:X16}, AT_BASE=0x{interpBase:X16}, " +
+                    $"AT_PHDR=0x{loadResult.ProgramHeaderAddress:X16}, AT_EXECFN=0x{execfnAddr:X16}");
         }
 
         private static string[] GetDefaultEnvironment()
@@ -574,6 +597,46 @@ namespace LinuxBinaryTranslator
                 "COLUMNS=80",
                 "LINES=24",
             };
+        }
+
+        private static string FormatBytes(byte[] data)
+        {
+            if (data.Length == 0)
+                return "(none)";
+
+            int count = Math.Min(data.Length, 16);
+            var parts = new string[count];
+            for (int i = 0; i < count; i++)
+                parts[i] = data[i].ToString("X2");
+            return string.Join(" ", parts);
+        }
+
+        private static string FormatRecentBlocks(IEnumerable<ulong> addresses)
+        {
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (ulong address in addresses)
+            {
+                if (!first)
+                    sb.Append(" | ");
+                first = false;
+                sb.Append($"0x{address:X16}");
+            }
+            return sb.ToString();
+        }
+
+        private string DescribeRecentBlocks(IEnumerable<ulong> addresses)
+        {
+            var sb = new StringBuilder();
+            bool first = true;
+            foreach (ulong address in addresses)
+            {
+                if (!first)
+                    sb.Append(" || ");
+                first = false;
+                sb.Append(_translator.DescribeBlock(address, 6));
+            }
+            return sb.ToString();
         }
     }
 }

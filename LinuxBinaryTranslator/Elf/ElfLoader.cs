@@ -132,8 +132,8 @@ namespace LinuxBinaryTranslator.Elf
                 {
                     ulong fileOffset = phdr.p_offset;
                     ulong copyLen = Math.Min(phdr.p_filesz, (ulong)elfData.Length - fileOffset);
-                    var segment = new byte[copyLen];
-                    Array.Copy(elfData, (long)fileOffset, segment, 0, (long)copyLen);
+                    var segment = new byte[(int)copyLen];
+                    Array.Copy(elfData, (int)fileOffset, segment, 0, (int)copyLen);
                     _memory.Write(phdr.p_vaddr, segment);
                 }
 
@@ -155,11 +155,7 @@ namespace LinuxBinaryTranslator.Elf
 
             // Store program headers in memory for auxvec AT_PHDR
             if (header.e_phoff > 0 && header.e_phnum > 0)
-            {
-                ulong phdrSize = (ulong)(header.e_phentsize * header.e_phnum);
-                // Program headers may already be in a loaded segment
-                result.ProgramHeaderAddress = result.BaseAddress + header.e_phoff;
-            }
+                result.ProgramHeaderAddress = ComputeProgramHeaderAddress(header, programHeaders, 0);
 
             return result;
         }
@@ -219,8 +215,8 @@ namespace LinuxBinaryTranslator.Elf
                 {
                     ulong fileOffset = phdr.p_offset;
                     ulong copyLen = Math.Min(phdr.p_filesz, (ulong)interpData.Length - fileOffset);
-                    var segment = new byte[copyLen];
-                    Array.Copy(interpData, (long)fileOffset, segment, 0, (long)copyLen);
+                    var segment = new byte[(int)copyLen];
+                    Array.Copy(interpData, (int)fileOffset, segment, 0, (int)copyLen);
                     _memory.Write(loadAddr, segment);
                 }
 
@@ -240,9 +236,7 @@ namespace LinuxBinaryTranslator.Elf
             result.BrkAddress = highestAddr;
 
             if (header.e_phoff > 0 && header.e_phnum > 0)
-            {
-                result.ProgramHeaderAddress = result.BaseAddress + header.e_phoff;
-            }
+                result.ProgramHeaderAddress = ComputeProgramHeaderAddress(header, programHeaders, baseOffset);
 
             return result;
         }
@@ -325,6 +319,31 @@ namespace LinuxBinaryTranslator.Elf
             }
 
             return headers;
+        }
+
+        private static ulong ComputeProgramHeaderAddress(Elf64Header header, List<Elf64ProgramHeader> programHeaders, ulong loadBias)
+        {
+            foreach (var phdr in programHeaders)
+            {
+                if (phdr.p_type == ElfConstants.PT_PHDR)
+                    return loadBias + phdr.p_vaddr;
+            }
+
+            ulong phdrTableFileStart = header.e_phoff;
+            ulong phdrTableFileEnd = phdrTableFileStart + (ulong)(header.e_phentsize * header.e_phnum);
+
+            foreach (var phdr in programHeaders)
+            {
+                if (!phdr.IsLoadable || phdr.p_filesz == 0)
+                    continue;
+
+                ulong segmentFileStart = phdr.p_offset;
+                ulong segmentFileEnd = phdr.p_offset + phdr.p_filesz;
+                if (phdrTableFileStart >= segmentFileStart && phdrTableFileEnd <= segmentFileEnd)
+                    return loadBias + phdr.p_vaddr + (phdrTableFileStart - segmentFileStart);
+            }
+
+            return loadBias + header.e_phoff;
         }
 
         private const ulong PageSize = 4096;

@@ -8,18 +8,18 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using LinuxBinaryTranslator.FileSystem;
+using LinuxBinaryTranslator.Terminal;
 using Windows.Storage;
 using Windows.Storage.Pickers;
 using Windows.System;
-using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
-using LinuxBinaryTranslator.FileSystem;
-using LinuxBinaryTranslator.Terminal;
 
 namespace LinuxBinaryTranslator
 {
@@ -34,18 +34,57 @@ namespace LinuxBinaryTranslator
         private CancellationTokenSource? _cts;
         private readonly StringBuilder _displayBuffer = new StringBuilder();
 
-        // Rate-limit UI updates for performance
+        // Rate-limit UI updates for performance once the visual tree is ready.
         private DispatcherTimer? _uiUpdateTimer;
         private bool _outputDirty;
+        private bool _viewReady;
 
         public MainPage()
         {
-            this.InitializeComponent();
+            Debug.WriteLine("[LBT] MainPage ctor: begin");
 
-            // Set up a timer to batch UI updates (16ms ≈ 60fps)
-            _uiUpdateTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-            _uiUpdateTimer.Tick += UiUpdateTimer_Tick;
+            try
+            {
+                InitializeComponent();
+                Debug.WriteLine("[LBT] MainPage ctor: InitializeComponent complete");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("[LBT] MainPage ctor: InitializeComponent failed: " + ex);
+                Content = new TextBlock
+                {
+                    Text = "Linux Binary Translator failed to initialize its UI.\n\n" + ex,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(24)
+                };
+                return;
+            }
+
+            Loaded += MainPage_Loaded;
+            Unloaded += MainPage_Unloaded;
+            Debug.WriteLine("[LBT] MainPage ctor: complete");
+        }
+
+        private void MainPage_Loaded(object sender, RoutedEventArgs e)
+        {
+            Debug.WriteLine("[LBT] MainPage Loaded");
+            _viewReady = true;
+
+            if (_uiUpdateTimer == null)
+            {
+                _uiUpdateTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+                _uiUpdateTimer.Tick += UiUpdateTimer_Tick;
+            }
+
             _uiUpdateTimer.Start();
+            UpdateDisplay();
+        }
+
+        private void MainPage_Unloaded(object sender, RoutedEventArgs e)
+        {
+            Debug.WriteLine("[LBT] MainPage Unloaded");
+            _viewReady = false;
+            _uiUpdateTimer?.Stop();
         }
 
         /// <summary>
@@ -53,17 +92,29 @@ namespace LinuxBinaryTranslator
         /// </summary>
         private async void LoadButton_Click(object sender, RoutedEventArgs e)
         {
-            var picker = new FileOpenPicker
+            try
             {
-                ViewMode = PickerViewMode.List,
-                SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
-            };
-            picker.FileTypeFilter.Add("*");
+                var picker = new FileOpenPicker
+                {
+                    ViewMode = PickerViewMode.List,
+                    SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+                };
+                picker.FileTypeFilter.Add("*");
 
-            StorageFile file = await picker.PickSingleFileAsync();
-            if (file == null) return;
+                StorageFile file = await picker.PickSingleFileAsync();
+                if (file == null)
+                {
+                    return;
+                }
 
-            await LoadAndRunAsync(file);
+                await LoadAndRunAsync(file);
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"Load failed: {ex.Message}\n");
+                UpdateStatus("Load failed");
+                LogMessage("LoadButton_Click failed: " + ex);
+            }
         }
 
         /// <summary>
@@ -71,10 +122,8 @@ namespace LinuxBinaryTranslator
         /// </summary>
         private async Task LoadAndRunAsync(StorageFile file)
         {
-            // Stop any running execution
             StopExecution();
 
-            // Read the file
             var buffer = await FileIO.ReadBufferAsync(file);
             byte[] elfData = new byte[buffer.Length];
             using (var reader = Windows.Storage.Streams.DataReader.FromBuffer(buffer))
@@ -82,16 +131,13 @@ namespace LinuxBinaryTranslator
                 reader.ReadBytes(elfData);
             }
 
-            // Clear the display
             _displayBuffer.Clear();
             _displayBuffer.AppendLine($"Loading: {file.Name} ({elfData.Length} bytes)");
             UpdateDisplay();
 
-            // Set up terminal emulator
             _terminal = new TerminalEmulator();
             _terminal.OutputReceived += Terminal_OutputReceived;
 
-            // Set up the execution engine
             _engine = new ExecutionEngine(
                 stdinRead: _terminal.ReadInput,
                 stdoutWrite: _terminal.WriteOutput,
@@ -100,7 +146,6 @@ namespace LinuxBinaryTranslator
 
             try
             {
-                // Load the ELF binary
                 var loadResult = _engine.LoadBinary(elfData, new[] { file.Name });
                 AppendOutput($"Entry point: 0x{loadResult.EntryPoint:X16}\n");
                 AppendOutput($"Segments: {loadResult.Segments.Count}\n");
@@ -111,17 +156,17 @@ namespace LinuxBinaryTranslator
                 LoadButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
 
-                // Execute
                 _cts = new CancellationTokenSource();
                 var result = await _engine.ExecuteAsync(_cts.Token);
 
-                // Display results
-                AppendOutput($"\n--- Execution finished ---\n");
+                AppendOutput("\n--- Execution finished ---\n");
                 AppendOutput($"Exit code: {result.ExitCode}\n");
                 AppendOutput($"Blocks executed: {result.InstructionBlocksExecuted:N0}\n");
                 AppendOutput($"Elapsed: {result.ElapsedTime.TotalMilliseconds:F1} ms\n");
                 if (result.Error != null)
+                {
                     AppendOutput($"Error: {result.Error}\n");
+                }
 
                 UpdateStatus($"Exited ({result.ExitCode})");
                 UpdatePerformance($"{result.InstructionBlocksExecuted:N0} blocks in {result.ElapsedTime.TotalMilliseconds:F0}ms");
@@ -135,6 +180,7 @@ namespace LinuxBinaryTranslator
             {
                 AppendOutput($"Error: {ex.Message}\n");
                 UpdateStatus("Error");
+                LogMessage("LoadAndRunAsync failed: " + ex);
             }
             finally
             {
@@ -149,17 +195,29 @@ namespace LinuxBinaryTranslator
         /// </summary>
         private async void BootRootfsButton_Click(object sender, RoutedEventArgs e)
         {
-            var picker = new FolderPicker
+            try
             {
-                ViewMode = PickerViewMode.List,
-                SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
-            };
-            picker.FileTypeFilter.Add("*");
+                var picker = new FolderPicker
+                {
+                    ViewMode = PickerViewMode.List,
+                    SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+                };
+                picker.FileTypeFilter.Add("*");
 
-            StorageFolder folder = await picker.PickSingleFolderAsync();
-            if (folder == null) return;
+                StorageFolder folder = await picker.PickSingleFolderAsync();
+                if (folder == null)
+                {
+                    return;
+                }
 
-            await BootRootfsAsync(folder);
+                await BootRootfsAsync(folder);
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"Rootfs boot failed: {ex.Message}\n");
+                UpdateStatus("Boot failed");
+                LogMessage("BootRootfsButton_Click failed: " + ex);
+            }
         }
 
         /// <summary>
@@ -170,15 +228,13 @@ namespace LinuxBinaryTranslator
             StopExecution();
 
             _displayBuffer.Clear();
-            _displayBuffer.AppendLine($"Loading rootfs from: {rootfsFolder.Path}");
+            _displayBuffer.AppendLine($"Loading rootfs from: {rootfsFolder.Name}");
             _displayBuffer.AppendLine("Scanning files...");
             UpdateDisplay();
 
-            // Set up terminal emulator
             _terminal = new TerminalEmulator();
             _terminal.OutputReceived += Terminal_OutputReceived;
 
-            // Set up the execution engine
             _engine = new ExecutionEngine(
                 stdinRead: _terminal.ReadInput,
                 stdoutWrite: _terminal.WriteOutput,
@@ -187,15 +243,11 @@ namespace LinuxBinaryTranslator
 
             try
             {
-                // Scan the rootfs folder and load files into memory
                 var fileMap = new Dictionary<string, byte[]>();
                 int fileCount = 0;
                 long totalBytes = 0;
 
-                await Task.Run(async () =>
-                {
-                    await ScanFolderRecursive(rootfsFolder, "", fileMap);
-                });
+                await ScanFolderTreeAsync(rootfsFolder, fileMap);
 
                 foreach (var kvp in fileMap)
                 {
@@ -206,7 +258,6 @@ namespace LinuxBinaryTranslator
                 AppendOutput($"Found {fileCount} files ({totalBytes / 1024}KB)\n");
                 AppendOutput("Mounting rootfs...\n");
 
-                // Create rootfs manager and load the file map
                 var rootfs = new RootfsManager(_engine.Vfs, LogMessage);
                 var info = rootfs.LoadFromFileMap(fileMap);
 
@@ -220,22 +271,20 @@ namespace LinuxBinaryTranslator
                 BootRootfsButton.IsEnabled = false;
                 StopButton.IsEnabled = true;
 
-                // Boot the rootfs (loads the shell binary)
                 var loadResult = _engine.BootRootfs(rootfs);
-
                 AppendOutput($"Entry point: 0x{loadResult.EntryPoint:X16}\n");
 
-                // Execute
                 _cts = new CancellationTokenSource();
                 var result = await _engine.ExecuteAsync(_cts.Token);
 
-                // Display results
-                AppendOutput($"\n--- Session ended ---\n");
+                AppendOutput("\n--- Session ended ---\n");
                 AppendOutput($"Exit code: {result.ExitCode}\n");
                 AppendOutput($"Blocks executed: {result.InstructionBlocksExecuted:N0}\n");
                 AppendOutput($"Elapsed: {result.ElapsedTime.TotalMilliseconds:F1} ms\n");
                 if (result.Error != null)
+                {
                     AppendOutput($"Error: {result.Error}\n");
+                }
 
                 UpdateStatus($"Exited ({result.ExitCode})");
                 UpdatePerformance($"{result.InstructionBlocksExecuted:N0} blocks in {result.ElapsedTime.TotalMilliseconds:F0}ms");
@@ -249,6 +298,7 @@ namespace LinuxBinaryTranslator
             {
                 AppendOutput($"Error: {ex.Message}\n");
                 UpdateStatus("Error");
+                LogMessage("BootRootfsAsync failed: " + ex);
             }
             finally
             {
@@ -259,39 +309,67 @@ namespace LinuxBinaryTranslator
         }
 
         /// <summary>
-        /// Recursively scan a folder and load all files into a path→data map.
-        /// Paths are relative to the rootfs root (e.g., "/bin/bash").
+        /// Iteratively scan a folder and load all files into a path to data map.
+        /// Paths are relative to the rootfs root (for example, /bin/bash).
         /// </summary>
-        private async Task ScanFolderRecursive(StorageFolder folder, string prefix,
-                                                Dictionary<string, byte[]> fileMap)
+        private async Task ScanFolderTreeAsync(StorageFolder rootFolder, Dictionary<string, byte[]> fileMap)
         {
-            // Get all files in this folder
-            var files = await folder.GetFilesAsync();
-            foreach (var file in files)
+            var pending = new Queue<Tuple<StorageFolder, string>>();
+            pending.Enqueue(Tuple.Create(rootFolder, ""));
+
+            while (pending.Count > 0)
             {
+                var current = pending.Dequeue();
+                StorageFolder folder = current.Item1;
+                string prefix = current.Item2;
+
+                IReadOnlyList<StorageFile> files;
                 try
                 {
-                    var buffer = await FileIO.ReadBufferAsync(file);
-                    byte[] data = new byte[buffer.Length];
-                    using (var reader = Windows.Storage.Streams.DataReader.FromBuffer(buffer))
-                    {
-                        reader.ReadBytes(data);
-                    }
-                    string path = prefix + "/" + file.Name;
-                    fileMap[path] = data;
+                    files = await folder.GetFilesAsync();
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Skip files that can't be read
+                    LogMessage($"Skipping files in '{folder.Name}': {ex.Message}");
+                    continue;
                 }
-            }
 
-            // Recurse into subfolders
-            var subFolders = await folder.GetFoldersAsync();
-            foreach (var sub in subFolders)
-            {
-                string subPrefix = prefix + "/" + sub.Name;
-                await ScanFolderRecursive(sub, subPrefix, fileMap);
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var buffer = await FileIO.ReadBufferAsync(file);
+                        byte[] data = new byte[buffer.Length];
+                        using (var reader = Windows.Storage.Streams.DataReader.FromBuffer(buffer))
+                        {
+                            reader.ReadBytes(data);
+                        }
+
+                        string path = prefix + "/" + file.Name;
+                        fileMap[path] = data;
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"Skipping file '{file.Name}': {ex.Message}");
+                    }
+                }
+
+                IReadOnlyList<StorageFolder> subFolders;
+                try
+                {
+                    subFolders = await folder.GetFoldersAsync();
+                }
+                catch (Exception ex)
+                {
+                    LogMessage($"Skipping folders in '{folder.Name}': {ex.Message}");
+                    continue;
+                }
+
+                foreach (var sub in subFolders)
+                {
+                    string subPrefix = prefix + "/" + sub.Name;
+                    pending.Enqueue(Tuple.Create(sub, subPrefix));
+                }
             }
         }
 
@@ -339,6 +417,7 @@ namespace LinuxBinaryTranslator
                 _terminal.SendLine(text);
                 AppendOutput($"$ {text}\n");
             }
+
             InputBox.Text = "";
         }
 
@@ -347,67 +426,66 @@ namespace LinuxBinaryTranslator
         /// </summary>
         private void Page_KeyDown(object sender, KeyRoutedEventArgs e)
         {
-            if (_terminal == null) return;
+            if (_terminal == null)
+            {
+                return;
+            }
 
             switch (e.Key)
             {
-                // Xbox B button or Escape → Ctrl+C
                 case VirtualKey.Escape:
                 case VirtualKey.GamepadB:
                     _terminal.SendKey(TerminalKey.CtrlC);
                     e.Handled = true;
                     break;
 
-                // Xbox X button → Load binary
                 case VirtualKey.GamepadX:
                     LoadButton_Click(sender, e);
                     e.Handled = true;
                     break;
 
-                // Xbox Y button → Clear terminal
                 case VirtualKey.GamepadY:
                     _displayBuffer.Clear();
                     UpdateDisplay();
                     e.Handled = true;
                     break;
 
-                // Xbox A button → Submit input
                 case VirtualKey.GamepadA:
                     SendInput();
                     e.Handled = true;
                     break;
 
-                // DPad → Arrow keys
                 case VirtualKey.GamepadDPadUp:
                     _terminal.SendKey(TerminalKey.Up);
                     e.Handled = true;
                     break;
+
                 case VirtualKey.GamepadDPadDown:
                     _terminal.SendKey(TerminalKey.Down);
                     e.Handled = true;
                     break;
+
                 case VirtualKey.GamepadDPadLeft:
                     _terminal.SendKey(TerminalKey.Left);
                     e.Handled = true;
                     break;
+
                 case VirtualKey.GamepadDPadRight:
                     _terminal.SendKey(TerminalKey.Right);
                     e.Handled = true;
                     break;
 
-                // LB → Tab, RB → Backspace
                 case VirtualKey.GamepadLeftShoulder:
                     _terminal.SendKey(TerminalKey.Tab);
                     e.Handled = true;
                     break;
+
                 case VirtualKey.GamepadRightShoulder:
                     _terminal.SendKey(TerminalKey.Backspace);
                     e.Handled = true;
                     break;
             }
         }
-
-        // === Terminal output handling ===
 
         private void Terminal_OutputReceived(object? sender, TerminalOutputEventArgs e)
         {
@@ -416,7 +494,11 @@ namespace LinuxBinaryTranslator
 
         private void UiUpdateTimer_Tick(object? sender, object e)
         {
-            if (!_outputDirty || _terminal == null) return;
+            if (!_outputDirty || _terminal == null)
+            {
+                return;
+            }
+
             _outputDirty = false;
 
             string newText = _terminal.FlushOutput();
@@ -424,9 +506,10 @@ namespace LinuxBinaryTranslator
             {
                 _displayBuffer.Append(newText);
 
-                // Cap total display size
                 if (_displayBuffer.Length > 512 * 1024)
+                {
                     _displayBuffer.Remove(0, _displayBuffer.Length - 256 * 1024);
+                }
 
                 UpdateDisplay();
             }
@@ -434,9 +517,25 @@ namespace LinuxBinaryTranslator
 
         private void UpdateDisplay()
         {
+            if (!_viewReady || OutputTextBlock == null)
+            {
+                return;
+            }
+
             OutputTextBlock.Text = _displayBuffer.ToString();
-            // Auto-scroll to bottom
-            OutputScrollViewer.ChangeView(null, OutputScrollViewer.ScrollableHeight, null);
+            if (OutputScrollViewer == null)
+            {
+                return;
+            }
+
+            try
+            {
+                OutputScrollViewer.ChangeView(null, OutputScrollViewer.ScrollableHeight, null);
+            }
+            catch (Exception ex)
+            {
+                LogMessage("ChangeView failed: " + ex.Message);
+            }
         }
 
         private void AppendOutput(string text)
@@ -447,17 +546,23 @@ namespace LinuxBinaryTranslator
 
         private void UpdateStatus(string status)
         {
-            StatusText.Text = status;
+            if (StatusText != null)
+            {
+                StatusText.Text = status;
+            }
         }
 
         private void UpdatePerformance(string text)
         {
-            PerformanceText.Text = text;
+            if (PerformanceText != null)
+            {
+                PerformanceText.Text = text;
+            }
         }
 
         private void LogMessage(string message)
         {
-            System.Diagnostics.Debug.WriteLine($"[LBT] {message}");
+            Debug.WriteLine($"[LBT] {message}");
         }
     }
 }

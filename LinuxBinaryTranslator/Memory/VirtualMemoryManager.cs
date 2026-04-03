@@ -206,7 +206,7 @@ namespace LinuxBinaryTranslator.Memory
                     ulong keepSize = region.End - unmapEnd;
                     var keepRegion = new MemoryRegion(keepStart, keepSize, region.Protection);
                     ulong srcOffset = unmapEnd - region.Start;
-                    Array.Copy(region.Data, (long)srcOffset, keepRegion.Data, 0, (long)keepSize);
+                    Array.Copy(region.Data, (int)srcOffset, keepRegion.Data, 0, (int)keepSize);
                     toAdd.Add(keepRegion);
                 }
             }
@@ -248,7 +248,7 @@ namespace LinuxBinaryTranslator.Memory
         /// </summary>
         public byte[] Read(ulong address, ulong count)
         {
-            var result = new byte[count];
+            var result = new byte[(int)count];
             ulong bytesRead = 0;
 
             while (bytesRead < count)
@@ -261,7 +261,7 @@ namespace LinuxBinaryTranslator.Memory
                 ulong offset = currentAddr - region.Start;
                 ulong available = region.Size - offset;
                 ulong toRead = Math.Min(available, count - bytesRead);
-                Array.Copy(region.Data, (long)offset, result, (long)bytesRead, (long)toRead);
+                Array.Copy(region.Data, (int)offset, result, (int)bytesRead, (int)toRead);
                 bytesRead += toRead;
             }
 
@@ -337,7 +337,7 @@ namespace LinuxBinaryTranslator.Memory
                 ulong offset = currentAddr - region.Start;
                 ulong available = region.Size - offset;
                 ulong toWrite = Math.Min(available, count - bytesWritten);
-                Array.Copy(data, (long)bytesWritten, region.Data, (long)offset, (long)toWrite);
+                Array.Copy(data, (int)bytesWritten, region.Data, (int)offset, (int)toWrite);
                 bytesWritten += toWrite;
             }
         }
