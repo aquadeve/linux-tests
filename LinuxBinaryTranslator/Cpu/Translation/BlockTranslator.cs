@@ -879,29 +879,41 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // MOV AL, moffs8 (A0)
                 case 0xA0:
-                    state.AL = mem.ReadByte((ulong)inst.Immediate);
+                {
+                    ulong moffs = ApplySegmentBase(inst, state, (ulong)inst.Immediate);
+                    state.AL = mem.ReadByte(moffs);
                     return 0;
+                }
 
                 // MOV RAX/EAX, moffs (A1)
                 case 0xA1:
+                {
+                    ulong moffs = ApplySegmentBase(inst, state, (ulong)inst.Immediate);
                     if (inst.RexW)
-                        state.RAX = mem.ReadUInt64((ulong)inst.Immediate);
+                        state.RAX = mem.ReadUInt64(moffs);
                     else
-                        state.EAX = mem.ReadUInt32((ulong)inst.Immediate);
+                        state.EAX = mem.ReadUInt32(moffs);
                     return 0;
+                }
 
                 // MOV moffs8, AL (A2)
                 case 0xA2:
-                    mem.WriteByte((ulong)inst.Immediate, state.AL);
+                {
+                    ulong moffs = ApplySegmentBase(inst, state, (ulong)inst.Immediate);
+                    mem.WriteByte(moffs, state.AL);
                     return 0;
+                }
 
                 // MOV moffs, RAX/EAX (A3)
                 case 0xA3:
+                {
+                    ulong moffs = ApplySegmentBase(inst, state, (ulong)inst.Immediate);
                     if (inst.RexW)
-                        mem.WriteUInt64((ulong)inst.Immediate, state.RAX);
+                        mem.WriteUInt64(moffs, state.RAX);
                     else
-                        mem.WriteUInt32((ulong)inst.Immediate, state.EAX);
+                        mem.WriteUInt32(moffs, state.EAX);
                     return 0;
+                }
 
                 // CMPSB (A6) — compare [RSI] with [RDI]
                 case 0xA6:

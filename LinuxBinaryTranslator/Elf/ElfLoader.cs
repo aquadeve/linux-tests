@@ -67,6 +67,13 @@ namespace LinuxBinaryTranslator.Elf
         }
 
         /// <summary>
+        /// Default load bias for PIE (ET_DYN) main executables.
+        /// This mirrors the Linux kernel's default load address for PIE binaries
+        /// (typically randomized around 0x555555554000 with ASLR).
+        /// </summary>
+        private const ulong PieDefaultLoadBias = 0x555555554000UL;
+
+        /// <summary>
         /// Load an ELF binary from a byte array into virtual memory.
         /// </summary>
         public ElfLoadResult Load(byte[] elfData)
@@ -78,9 +85,17 @@ namespace LinuxBinaryTranslator.Elf
             ValidateHeader(header);
 
             var programHeaders = ParseProgramHeaders(elfData, header);
+
+            // For PIE (ET_DYN) main executables, apply a load bias so they
+            // don't get mapped at address 0. The Linux kernel loads PIE
+            // binaries at a high address (with ASLR, typically near 0x555555554000).
+            // Without this, ld.so gets confused because the main binary's load
+            // address is 0, which conflicts with null pointer semantics.
+            ulong loadBias = header.IsSharedObject() ? PieDefaultLoadBias : 0;
+
             var result = new ElfLoadResult
             {
-                EntryPoint = header.e_entry,
+                EntryPoint = header.e_entry + loadBias,
                 ProgramHeaderEntrySize = header.e_phentsize,
                 ProgramHeaderCount = header.e_phnum,
                 Machine = header.e_machine,
@@ -109,8 +124,9 @@ namespace LinuxBinaryTranslator.Elf
                 if (!phdr.IsLoadable || phdr.p_memsz == 0)
                     continue;
 
-                ulong alignedAddr = AlignDown(phdr.p_vaddr, PageSize);
-                ulong alignedEnd = AlignUp(phdr.p_vaddr + phdr.p_memsz, PageSize);
+                ulong loadAddr = phdr.p_vaddr + loadBias;
+                ulong alignedAddr = AlignDown(loadAddr, PageSize);
+                ulong alignedEnd = AlignUp(loadAddr + phdr.p_memsz, PageSize);
                 ulong regionSize = alignedEnd - alignedAddr;
 
                 // Track address range
@@ -134,19 +150,19 @@ namespace LinuxBinaryTranslator.Elf
                     ulong copyLen = Math.Min(phdr.p_filesz, (ulong)elfData.Length - fileOffset);
                     var segment = new byte[(int)copyLen];
                     Array.Copy(elfData, (int)fileOffset, segment, 0, (int)copyLen);
-                    _memory.Write(phdr.p_vaddr, segment);
+                    _memory.Write(loadAddr, segment);
                 }
 
                 // Zero-fill BSS (memory beyond file data)
                 if (phdr.p_memsz > phdr.p_filesz)
                 {
-                    ulong bssStart = phdr.p_vaddr + phdr.p_filesz;
+                    ulong bssStart = loadAddr + phdr.p_filesz;
                     ulong bssSize = phdr.p_memsz - phdr.p_filesz;
                     _memory.Zero(bssStart, bssSize);
                 }
 
                 result.Segments.Add(new LoadedSegment(
-                    phdr.p_vaddr, phdr.p_memsz, phdr.p_filesz,
+                    loadAddr, phdr.p_memsz, phdr.p_filesz,
                     phdr.IsReadable, phdr.IsWritable, phdr.IsExecutable));
             }
 
@@ -155,7 +171,7 @@ namespace LinuxBinaryTranslator.Elf
 
             // Store program headers in memory for auxvec AT_PHDR
             if (header.e_phoff > 0 && header.e_phnum > 0)
-                result.ProgramHeaderAddress = ComputeProgramHeaderAddress(header, programHeaders, 0);
+                result.ProgramHeaderAddress = ComputeProgramHeaderAddress(header, programHeaders, loadBias);
 
             return result;
         }

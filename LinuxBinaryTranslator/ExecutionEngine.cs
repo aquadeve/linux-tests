@@ -411,6 +411,11 @@ namespace LinuxBinaryTranslator
 
             // Auxiliary vector (from bottom up)
             // We'll build from top down, then copy
+            // AT_HWCAP: x86_64 baseline hardware capabilities from CPUID.01H:EDX.
+            // ld.so uses this for ifunc (indirect function) resolution to select
+            // optimized implementations based on CPU features.
+            const ulong X86_64_HWCAP = 0x078bfbffUL; // FPU+SSE+SSE2+CMOV+FXSR+MMX+...
+
             var auxv = new (ulong type, ulong value)[]
             {
                 (ElfConstants.AT_PHDR, loadResult.ProgramHeaderAddress),
@@ -420,6 +425,7 @@ namespace LinuxBinaryTranslator
                 (ElfConstants.AT_BASE, 0),
                 (ElfConstants.AT_FLAGS, 0),
                 (ElfConstants.AT_ENTRY, loadResult.EntryPoint),
+                (ElfConstants.AT_HWCAP, X86_64_HWCAP),
                 (ElfConstants.AT_UID, 1000),
                 (ElfConstants.AT_EUID, 1000),
                 (ElfConstants.AT_GID, 1000),
@@ -523,6 +529,11 @@ namespace LinuxBinaryTranslator
             sp &= ~0xFUL;
             ulong execfnAddr = argvPtrs.Length > 0 ? argvPtrs[0] : 0;
 
+            // AT_HWCAP: x86_64 baseline hardware capabilities from CPUID.01H:EDX.
+            // ld.so uses this for ifunc (indirect function) resolution to select
+            // optimized implementations based on CPU features.
+            const ulong X86_64_HWCAP = 0x078bfbffUL; // FPU+SSE+SSE2+CMOV+FXSR+MMX+...
+
             // Auxiliary vector — AT_ENTRY is the real binary entry, AT_BASE is interpreter base
             var auxv = new (ulong type, ulong value)[]
             {
@@ -533,6 +544,7 @@ namespace LinuxBinaryTranslator
                 (ElfConstants.AT_BASE, interpBase),
                 (ElfConstants.AT_FLAGS, 0),
                 (ElfConstants.AT_ENTRY, realEntry),
+                (ElfConstants.AT_HWCAP, X86_64_HWCAP),
                 (ElfConstants.AT_UID, 1000),
                 (ElfConstants.AT_EUID, 1000),
                 (ElfConstants.AT_GID, 1000),
