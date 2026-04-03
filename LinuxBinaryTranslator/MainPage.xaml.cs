@@ -18,6 +18,7 @@ using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
+using LinuxBinaryTranslator.FileSystem;
 using LinuxBinaryTranslator.Terminal;
 
 namespace LinuxBinaryTranslator
@@ -139,6 +140,158 @@ namespace LinuxBinaryTranslator
             {
                 LoadButton.IsEnabled = true;
                 StopButton.IsEnabled = false;
+            }
+        }
+
+        /// <summary>
+        /// Boot a Linux distribution from a rootfs folder.
+        /// The rootfs folder should be in app local storage or picked via folder picker.
+        /// </summary>
+        private async void BootRootfsButton_Click(object sender, RoutedEventArgs e)
+        {
+            var picker = new FolderPicker
+            {
+                ViewMode = PickerViewMode.List,
+                SuggestedStartLocation = PickerLocationId.DocumentsLibrary,
+            };
+            picker.FileTypeFilter.Add("*");
+
+            StorageFolder folder = await picker.PickSingleFolderAsync();
+            if (folder == null) return;
+
+            await BootRootfsAsync(folder);
+        }
+
+        /// <summary>
+        /// Load a rootfs from a folder and boot its default shell.
+        /// </summary>
+        private async Task BootRootfsAsync(StorageFolder rootfsFolder)
+        {
+            StopExecution();
+
+            _displayBuffer.Clear();
+            _displayBuffer.AppendLine($"Loading rootfs from: {rootfsFolder.Path}");
+            _displayBuffer.AppendLine("Scanning files...");
+            UpdateDisplay();
+
+            // Set up terminal emulator
+            _terminal = new TerminalEmulator();
+            _terminal.OutputReceived += Terminal_OutputReceived;
+
+            // Set up the execution engine
+            _engine = new ExecutionEngine(
+                stdinRead: _terminal.ReadInput,
+                stdoutWrite: _terminal.WriteOutput,
+                stderrWrite: _terminal.WriteOutput,
+                logger: LogMessage);
+
+            try
+            {
+                // Scan the rootfs folder and load files into memory
+                var fileMap = new Dictionary<string, byte[]>();
+                int fileCount = 0;
+                long totalBytes = 0;
+
+                await Task.Run(async () =>
+                {
+                    await ScanFolderRecursive(rootfsFolder, "", fileMap);
+                });
+
+                foreach (var kvp in fileMap)
+                {
+                    fileCount++;
+                    totalBytes += kvp.Value.Length;
+                }
+
+                AppendOutput($"Found {fileCount} files ({totalBytes / 1024}KB)\n");
+                AppendOutput("Mounting rootfs...\n");
+
+                // Create rootfs manager and load the file map
+                var rootfs = new RootfsManager(_engine.Vfs, LogMessage);
+                var info = rootfs.LoadFromFileMap(fileMap);
+
+                AppendOutput($"Distro: {info.DistroName} {info.Version}\n");
+                AppendOutput($"Shell: {info.ShellPath}\n");
+                AppendOutput($"Files: {info.FileCount}, Size: {info.TotalSize / 1024}KB\n");
+                AppendOutput("--- Booting ---\n\n");
+
+                UpdateStatus($"Booting {info.DistroName}");
+                LoadButton.IsEnabled = false;
+                BootRootfsButton.IsEnabled = false;
+                StopButton.IsEnabled = true;
+
+                // Boot the rootfs (loads the shell binary)
+                var loadResult = _engine.BootRootfs(rootfs);
+
+                AppendOutput($"Entry point: 0x{loadResult.EntryPoint:X16}\n");
+
+                // Execute
+                _cts = new CancellationTokenSource();
+                var result = await _engine.ExecuteAsync(_cts.Token);
+
+                // Display results
+                AppendOutput($"\n--- Session ended ---\n");
+                AppendOutput($"Exit code: {result.ExitCode}\n");
+                AppendOutput($"Blocks executed: {result.InstructionBlocksExecuted:N0}\n");
+                AppendOutput($"Elapsed: {result.ElapsedTime.TotalMilliseconds:F1} ms\n");
+                if (result.Error != null)
+                    AppendOutput($"Error: {result.Error}\n");
+
+                UpdateStatus($"Exited ({result.ExitCode})");
+                UpdatePerformance($"{result.InstructionBlocksExecuted:N0} blocks in {result.ElapsedTime.TotalMilliseconds:F0}ms");
+            }
+            catch (Elf.ElfLoadException ex)
+            {
+                AppendOutput($"ELF load error: {ex.Message}\n");
+                UpdateStatus("Boot failed");
+            }
+            catch (Exception ex)
+            {
+                AppendOutput($"Error: {ex.Message}\n");
+                UpdateStatus("Error");
+            }
+            finally
+            {
+                LoadButton.IsEnabled = true;
+                BootRootfsButton.IsEnabled = true;
+                StopButton.IsEnabled = false;
+            }
+        }
+
+        /// <summary>
+        /// Recursively scan a folder and load all files into a path→data map.
+        /// Paths are relative to the rootfs root (e.g., "/bin/bash").
+        /// </summary>
+        private async Task ScanFolderRecursive(StorageFolder folder, string prefix,
+                                                Dictionary<string, byte[]> fileMap)
+        {
+            // Get all files in this folder
+            var files = await folder.GetFilesAsync();
+            foreach (var file in files)
+            {
+                try
+                {
+                    var buffer = await FileIO.ReadBufferAsync(file);
+                    byte[] data = new byte[buffer.Length];
+                    using (var reader = Windows.Storage.Streams.DataReader.FromBuffer(buffer))
+                    {
+                        reader.ReadBytes(data);
+                    }
+                    string path = prefix + "/" + file.Name;
+                    fileMap[path] = data;
+                }
+                catch
+                {
+                    // Skip files that can't be read
+                }
+            }
+
+            // Recurse into subfolders
+            var subFolders = await folder.GetFoldersAsync();
+            foreach (var sub in subFolders)
+            {
+                string subPrefix = prefix + "/" + sub.Name;
+                await ScanFolderRecursive(sub, subPrefix, fileMap);
             }
         }
 

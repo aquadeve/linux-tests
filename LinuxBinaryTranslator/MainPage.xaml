@@ -35,6 +35,10 @@
                         Content="Load ELF Binary"
                         Click="LoadButton_Click"
                         XYFocusDown="{x:Bind InputBox}"/>
+                <Button x:Name="BootRootfsButton"
+                        Content="Boot Rootfs"
+                        Click="BootRootfsButton_Click"
+                        XYFocusDown="{x:Bind InputBox}"/>
                 <Button x:Name="StopButton"
                         Content="Stop"
                         Click="StopButton_Click"
@@ -56,7 +60,7 @@
                        IsTextSelectionEnabled="True"
                        TextWrapping="Wrap"
                        Padding="12"
-                       Text="Linux Binary Translator v1.0&#x0A;Ready. Load an ELF binary to begin.&#x0A;&#x0A;Xbox One Controls:&#x0A;  A Button  = Submit input&#x0A;  B Button  = Ctrl+C (interrupt)&#x0A;  X Button  = Load binary&#x0A;  Y Button  = Clear terminal&#x0A;  DPad      = Scroll output&#x0A;  LB/RB     = Tab / Backspace&#x0A;"/>
+                       Text="Linux Binary Translator v2.0&#x0A;Ready. Load an ELF binary or boot a rootfs to begin.&#x0A;&#x0A;Xbox One Controls:&#x0A;  A Button  = Submit input&#x0A;  B Button  = Ctrl+C (interrupt)&#x0A;  X Button  = Load binary&#x0A;  Y Button  = Clear terminal&#x0A;  DPad      = Scroll output&#x0A;  LB/RB     = Tab / Backspace&#x0A;&#x0A;Rootfs: Place a Linux rootfs folder in app local storage&#x0A;  Supports: Ubuntu, Debian, Arch Linux, Alpine&#x0A;"/>
         </ScrollViewer>
 
         <!-- Input box -->
