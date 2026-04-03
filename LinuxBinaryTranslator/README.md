@@ -119,11 +119,11 @@ msbuild /p:Configuration=Release /p:Platform=x64 /p:AppxBundle=Always
 
 ## Limitations
 
-- **Static binaries only** — no dynamic linking (no ld-linux.so or shared libraries)
+- **Static and dynamic binaries** — PT_INTERP interpreter (ld-linux.so) loaded from rootfs; full dynamic linking depends on the rootfs having correct shared libraries
 - **Single-threaded** — clone/fork return ENOSYS; futex supports single-threaded patterns
-- **No floating-point** — SSE/AVX/x87 instructions are not yet implemented
+- **SSE/SSE2/SSE3/SSE4 arithmetic** — scalar and packed float32/float64 operations implemented; x87 FPU and AVX are no-op stubs
 - **No networking** — socket syscalls return ENOSYS
-- **Read-only filesystem** — mkdir/unlink/rename return EROFS (host bridge supports writes)
+- **Writable virtual filesystem** — mkdir/unlink/creat work on VFS; rootfs files are read-only unless modified via O_CREAT/O_WRONLY at runtime
 
 ## License
 
