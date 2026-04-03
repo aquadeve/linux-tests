@@ -497,6 +497,33 @@ namespace LinuxBinaryTranslator.Cpu
                     inst.IsTerminator = true;
                     break;
 
+                // PUSHFQ (9C) / POPFQ (9D)
+                case 0x9C: case 0x9D:
+                    break;
+
+                // SAHF (9E) / LAHF (9F)
+                case 0x9E: case 0x9F:
+                    break;
+
+                // XCHG r64, RAX (91-97) — also XCHG RAX, RAX = NOP (90)
+                case 0x91: case 0x92: case 0x93:
+                case 0x94: case 0x95: case 0x96: case 0x97:
+                    break;
+
+                // LOOP (E2), LOOPE/LOOPZ (E1), LOOPNE/LOOPNZ (E0), JRCXZ (E3)
+                case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+                    inst.Immediate = (sbyte)_memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    inst.IsTerminator = true;
+                    break;
+
+                // x87 FPU (D8-DF) — decode ModRM, execute as no-op stubs
+                case 0xD8: case 0xD9: case 0xDA: case 0xDB:
+                case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
                 // UD2 (0F 0B) - illegal instruction
                 case 0x0F:
                     // Already handled as two-byte prefix above
@@ -726,6 +753,67 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // LFENCE (0F AE /5), MFENCE (/6), SFENCE (/7) — memory fences
                 case 0xAE:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // UCOMISS xmm,xmm/m32 (0F 2E), UCOMISD (66 0F 2E)
+                // COMISS (0F 2F), COMISD (66 0F 2F)
+                case 0x2E: case 0x2F:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CVTSI2SS (F3 0F 2A), CVTSI2SD (F2 0F 2A)
+                case 0x2A:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CVTTSS2SI (F3 0F 2C), CVTTSD2SI (F2 0F 2C)
+                case 0x2C:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CVTSS2SI (F3 0F 2D), CVTSD2SI (F2 0F 2D)
+                case 0x2D:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // SQRTPS (0F 51), SQRTSS (F3 0F 51), SQRTPD (66 0F 51), SQRTSD (F2 0F 51)
+                case 0x51:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // ANDPS (0F 54), ANDNPS (0F 55), ORPS (0F 56)
+                case 0x54: case 0x55: case 0x56:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // MINPS/MINSS/MINPD/MINSD (0F 5D), MAXPS/MAXSS/MAXPD/MAXSD (0F 5F)
+                case 0x5D: case 0x5F:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PMOVMSKB (66 0F D7)
+                case 0xD7:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PMINUB (66 0F DA), PMAXUB (66 0F DE)
+                case 0xDA: case 0xDE:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PAVGB (66 0F E0), PAVGW (66 0F E3)
+                case 0xE0: case 0xE3:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CVTPS2PD (0F 5A), CVTPD2PS (66 0F 5A), CVTSS2SD (F3 0F 5A), CVTSD2SS (F2 0F 5A)
+                case 0x5A:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CVTDQ2PS (0F 5B), CVTTPS2DQ (F3 0F 5B), CVTPS2DQ (66 0F 5B)
+                case 0x5B:
                     DecodeModRM(inst, ref pos);
                     break;
 
