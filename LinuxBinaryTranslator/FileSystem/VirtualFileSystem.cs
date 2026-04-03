@@ -266,13 +266,23 @@ namespace LinuxBinaryTranslator.FileSystem
     /// <summary>
     /// Virtual file system managing file descriptors and path-to-file mapping.
     /// Provides the file abstraction layer between Linux syscalls and the
-    /// UWP sandbox environment.
+    /// UWP sandbox environment. Supports rootfs mounting for running Linux
+    /// distribution binaries (bash, coreutils, etc.).
     /// </summary>
     public sealed class VirtualFileSystem
     {
         private readonly Dictionary<int, IVirtualFile> _fds = new Dictionary<int, IVirtualFile>();
         private readonly Dictionary<string, Func<IVirtualFile>> _mountPoints = new Dictionary<string, Func<IVirtualFile>>();
         private int _nextFd = 3;
+
+        // Rootfs manager for full directory hierarchy support
+        private RootfsManager? _rootfs;
+
+        // In-memory writable files (for rootfs files that are modified at runtime)
+        private readonly Dictionary<string, byte[]> _writableFiles = new Dictionary<string, byte[]>();
+
+        // Tracked directories created at runtime via mkdir
+        private readonly HashSet<string> _createdDirs = new HashSet<string>();
 
         /// <summary>
         /// Initialize the VFS with standard file descriptors and device nodes.
@@ -345,11 +355,53 @@ namespace LinuxBinaryTranslator.FileSystem
 
         public int Open(string path, int flags, int mode)
         {
-            // Check mount points
+            // Check mount points first (device files, proc, etc.)
             if (_mountPoints.TryGetValue(path, out var factory))
             {
                 int fd = _nextFd++;
                 _fds[fd] = factory();
+                return fd;
+            }
+
+            // Check writable files (files created/modified at runtime)
+            if (_writableFiles.TryGetValue(path, out var wdata))
+            {
+                int fd = _nextFd++;
+                _fds[fd] = new MemoryFile((byte[])wdata.Clone(), flags);
+                return fd;
+            }
+
+            // Check rootfs manager
+            if (_rootfs != null)
+            {
+                byte[]? rootfsData = _rootfs.ReadFile(path);
+                if (rootfsData != null)
+                {
+                    int fd = _nextFd++;
+                    // O_WRONLY=1, O_RDWR=2, O_CREAT=0x40
+                    bool writable = (flags & 0x3) != 0;
+                    if (writable)
+                    {
+                        // For writable files, make a copy in writable store
+                        byte[] copy = (byte[])rootfsData.Clone();
+                        _writableFiles[path] = copy;
+                        _fds[fd] = new MemoryFile(copy, flags);
+                    }
+                    else
+                    {
+                        _fds[fd] = new MemoryFile((byte[])rootfsData.Clone(), flags);
+                    }
+                    return fd;
+                }
+            }
+
+            // O_CREAT flag — create a new writable file
+            if ((flags & 0x40) != 0) // O_CREAT
+            {
+                int fd = _nextFd++;
+                byte[] newData = Array.Empty<byte>();
+                _writableFiles[path] = newData;
+                _fds[fd] = new MemoryFile(newData, flags);
                 return fd;
             }
 
@@ -411,11 +463,73 @@ namespace LinuxBinaryTranslator.FileSystem
                 return file.Stat();
             }
 
-            // Directories
-            if (path == "/" || path == "/dev" || path == "/proc" || path == "/tmp" ||
-                path == "/etc" || path == "/proc/self" || path == "/proc/self/fd" ||
-                path == "/dev/fd" || path == "/home" || path == "/home/user" ||
-                path == "/usr" || path == "/usr/bin" || path == "/bin")
+            // Check writable files
+            if (_writableFiles.TryGetValue(path, out var wdata))
+            {
+                return new VfsStatResult
+                {
+                    Mode = 0x8000 | 0x01A4, // S_IFREG | 0644
+                    Size = wdata.Length,
+                    Ino = (ulong)path.GetHashCode(),
+                };
+            }
+
+            // Check rootfs manager
+            if (_rootfs != null)
+            {
+                if (_rootfs.IsDirectory(path))
+                {
+                    return new VfsStatResult
+                    {
+                        Mode = 0x4000 | 0x01ED, // S_IFDIR | 0755
+                        Nlink = 2,
+                        Ino = (ulong)path.GetHashCode(),
+                    };
+                }
+
+                // Check for symlink
+                string? linkTarget = _rootfs.ReadLink(path);
+                if (linkTarget != null)
+                {
+                    // For stat, follow symlink and report the target's stat
+                    string resolved = _rootfs.ResolveSymlink(path, linkTarget);
+                    byte[]? data = _rootfs.ReadFile(resolved);
+                    if (data != null)
+                    {
+                        return new VfsStatResult
+                        {
+                            Mode = 0x8000 | 0x01ED, // S_IFREG | 0755
+                            Size = data.Length,
+                            Ino = (ulong)resolved.GetHashCode(),
+                        };
+                    }
+                }
+
+                byte[]? fileData = _rootfs.ReadFile(path);
+                if (fileData != null)
+                {
+                    return new VfsStatResult
+                    {
+                        Mode = 0x8000 | 0x01ED, // S_IFREG | 0755
+                        Size = fileData.Length,
+                        Ino = (ulong)path.GetHashCode(),
+                    };
+                }
+            }
+
+            // Built-in directories
+            if (IsBuiltinDirectory(path))
+            {
+                return new VfsStatResult
+                {
+                    Mode = 0x4000 | 0x01ED, // S_IFDIR | 0755
+                    Nlink = 2,
+                    Ino = (ulong)path.GetHashCode(),
+                };
+            }
+
+            // Check created directories
+            if (_createdDirs.Contains(path))
             {
                 return new VfsStatResult
                 {
@@ -431,10 +545,22 @@ namespace LinuxBinaryTranslator.FileSystem
         public bool Access(string path, int mode)
         {
             return _mountPoints.ContainsKey(path) ||
-                   path == "/" || path == "/dev" || path == "/proc" || path == "/tmp" ||
+                   _writableFiles.ContainsKey(path) ||
+                   IsBuiltinDirectory(path) ||
+                   _createdDirs.Contains(path) ||
+                   (_rootfs != null && _rootfs.Exists(path));
+        }
+
+        private static bool IsBuiltinDirectory(string path)
+        {
+            return path == "/" || path == "/dev" || path == "/proc" || path == "/tmp" ||
                    path == "/etc" || path == "/proc/self" || path == "/proc/self/fd" ||
                    path == "/dev/fd" || path == "/home" || path == "/home/user" ||
-                   path == "/usr" || path == "/usr/bin" || path == "/bin";
+                   path == "/usr" || path == "/usr/bin" || path == "/bin" ||
+                   path == "/sbin" || path == "/usr/sbin" || path == "/lib" ||
+                   path == "/lib64" || path == "/usr/lib" || path == "/var" ||
+                   path == "/root" || path == "/run" || path == "/sys" ||
+                   path == "/opt" || path == "/usr/local" || path == "/usr/local/bin";
         }
 
         public int Dup(int oldfd)
@@ -486,6 +612,127 @@ namespace LinuxBinaryTranslator.FileSystem
         public void Mount(string path, Func<IVirtualFile> fileFactory)
         {
             _mountPoints[path] = fileFactory;
+        }
+
+        /// <summary>
+        /// Set the rootfs manager for full directory hierarchy support.
+        /// </summary>
+        public void SetRootfsManager(RootfsManager rootfs)
+        {
+            _rootfs = rootfs;
+        }
+
+        /// <summary>
+        /// Get the rootfs manager (if set).
+        /// </summary>
+        public RootfsManager? GetRootfs() => _rootfs;
+
+        /// <summary>
+        /// Create a directory in the virtual filesystem.
+        /// </summary>
+        public int MakeDirectory(string path)
+        {
+            path = path.TrimEnd('/');
+            if (string.IsNullOrEmpty(path)) return -Syscall.Errno.EINVAL;
+            if (_createdDirs.Contains(path) || IsBuiltinDirectory(path) ||
+                (_rootfs != null && _rootfs.IsDirectory(path)))
+                return -Syscall.Errno.EEXIST;
+
+            _createdDirs.Add(path);
+            return 0;
+        }
+
+        /// <summary>
+        /// Remove a file from the virtual filesystem.
+        /// </summary>
+        public int Unlink(string path)
+        {
+            if (_writableFiles.Remove(path))
+                return 0;
+            if (_mountPoints.Remove(path))
+                return 0;
+            // Can't remove rootfs files
+            return -Syscall.Errno.EROFS;
+        }
+
+        /// <summary>
+        /// Read symlink target from rootfs.
+        /// </summary>
+        public string? ReadSymlink(string path)
+        {
+            return _rootfs?.ReadLink(path);
+        }
+
+        /// <summary>
+        /// List entries in a directory (for getdents64).
+        /// Returns entry names, or null if path is not a directory.
+        /// </summary>
+        public List<string>? ListDirectory(string path)
+        {
+            // Check if it's a directory
+            if (!IsBuiltinDirectory(path) && !_createdDirs.Contains(path) &&
+                (_rootfs == null || !_rootfs.IsDirectory(path)))
+            {
+                return null;
+            }
+
+            var entries = new List<string> { ".", ".." };
+
+            // From rootfs
+            if (_rootfs != null)
+            {
+                entries.AddRange(_rootfs.ListDirectory(path));
+            }
+
+            // From mount points
+            string prefix = path.EndsWith("/") ? path : path + "/";
+            var seen = new HashSet<string>(entries);
+            foreach (var mp in _mountPoints.Keys)
+            {
+                if (mp.StartsWith(prefix) && mp.Length > prefix.Length)
+                {
+                    string relative = mp.Substring(prefix.Length);
+                    int slashIdx = relative.IndexOf('/');
+                    string entry = slashIdx >= 0 ? relative.Substring(0, slashIdx) : relative;
+                    if (seen.Add(entry))
+                        entries.Add(entry);
+                }
+            }
+
+            // From writable files
+            foreach (var wf in _writableFiles.Keys)
+            {
+                if (wf.StartsWith(prefix) && wf.Length > prefix.Length)
+                {
+                    string relative = wf.Substring(prefix.Length);
+                    int slashIdx = relative.IndexOf('/');
+                    string entry = slashIdx >= 0 ? relative.Substring(0, slashIdx) : relative;
+                    if (seen.Add(entry))
+                        entries.Add(entry);
+                }
+            }
+
+            return entries;
+        }
+
+        /// <summary>
+        /// Read a file's raw bytes from the VFS/rootfs (used by execve).
+        /// </summary>
+        public byte[]? ReadFileBytes(string path)
+        {
+            // Check writable files first
+            if (_writableFiles.TryGetValue(path, out var wdata))
+                return wdata;
+
+            // Check rootfs
+            if (_rootfs != null)
+            {
+                byte[]? data = _rootfs.ReadFile(path);
+                if (data != null)
+                    return data;
+            }
+
+            return null;
         }
 
         /// <summary>
