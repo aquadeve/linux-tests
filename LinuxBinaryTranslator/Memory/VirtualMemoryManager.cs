@@ -448,17 +448,60 @@ namespace LinuxBinaryTranslator.Memory
             return 0;
         }
 
+        /// <summary>
+        /// Remove regions that overlap with [address, address+size), preserving
+        /// any data in non-overlapping portions by splitting regions. This is
+        /// critical for ELF loading where adjacent PT_LOAD segments share a
+        /// page boundary: the second Map() must not destroy data loaded by the
+        /// first segment (e.g., the ELF header at the base address).
+        /// </summary>
         private void RemoveOverlapping(ulong address, ulong size)
         {
-            var toRemove = _regions
-                .Where(kvp => kvp.Value.Overlaps(address, size))
-                .Select(kvp => kvp.Key)
-                .ToList();
+            ulong end = address + size;
+            var toRemove = new List<ulong>();
+            var toAdd = new List<MemoryRegion>();
+
+            foreach (var kvp in _regions)
+            {
+                var region = kvp.Value;
+                if (!region.Overlaps(address, size))
+                    continue;
+
+                toRemove.Add(kvp.Key);
+
+                // Preserve the portion of the existing region that lies BEFORE
+                // the new mapping range.
+                if (region.Start < address)
+                {
+                    ulong keepSize = address - region.Start;
+                    var keepRegion = new MemoryRegion(region.Start, keepSize, region.Protection);
+                    Array.Copy(region.Data, 0, keepRegion.Data, 0, (int)keepSize);
+                    toAdd.Add(keepRegion);
+                }
+
+                // Preserve the portion of the existing region that lies AFTER
+                // the new mapping range.
+                if (region.End > end)
+                {
+                    ulong keepStart = end;
+                    ulong keepSize = region.End - end;
+                    var keepRegion = new MemoryRegion(keepStart, keepSize, region.Protection);
+                    ulong srcOffset = end - region.Start;
+                    Array.Copy(region.Data, (int)srcOffset, keepRegion.Data, 0, (int)keepSize);
+                    toAdd.Add(keepRegion);
+                }
+            }
 
             foreach (var key in toRemove)
             {
                 _totalAllocated -= _regions[key].Size;
                 _regions.Remove(key);
+            }
+
+            foreach (var region in toAdd)
+            {
+                _regions[region.Start] = region;
+                _totalAllocated += region.Size;
             }
         }
 
