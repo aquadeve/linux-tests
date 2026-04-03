@@ -85,6 +85,10 @@ namespace LinuxBinaryTranslator.Cpu
             }
 
             inst.Length = (int)(pos - address);
+            inst.HasRepPrefix = hasRepPrefix;
+            inst.HasRepnePrefix = hasRepnePrefix;
+            inst.HasOperandOverride = hasOperandOverride;
+            inst.HasAddressOverride = hasAddressOverride;
             return inst;
         }
 
@@ -615,6 +619,115 @@ namespace LinuxBinaryTranslator.Cpu
 
                 // LZCNT/TZCNT (F3 0F BD / F3 0F BC) — leading/trailing zero count
                 // Already handled as BSF/BSR above
+
+                // === SSE/SSE2 instructions commonly found in static binaries ===
+                // These are decoded to prevent choking on SSE instructions used for
+                // memory initialization (xorps, movaps, movdqa) even in integer code.
+
+                // MOVAPS/MOVUPS xmm, xmm/m128 (0F 28/29, 0F 10/11)
+                case 0x10: case 0x11: case 0x28: case 0x29:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // MOVDQA/MOVDQU xmm, xmm/m128 (66 0F 6F/7F)
+                case 0x6F: case 0x7F:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // XORPS/XORPD xmm, xmm/m128 (0F 57), PXOR (66 0F EF)
+                case 0x57: case 0xEF:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // MOVD/MOVQ xmm, r/m32/64 (66 0F 6E/7E)
+                case 0x6E: case 0x7E:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // MOVSS (F3 0F 10/11), MOVSD (F2 0F 10/11) — already covered by 0x10/0x11
+
+                // PUNPCKL/H (66 0F 60-6D), PACK/UNPACK
+                case 0x60: case 0x61: case 0x62: case 0x63:
+                case 0x64: case 0x65: case 0x66: case 0x67:
+                case 0x68: case 0x69: case 0x6A: case 0x6B:
+                case 0x6C: case 0x6D:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PCMPEQ/PCMPGT (66 0F 74-76)
+                case 0x74: case 0x75: case 0x76:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PSHUFD (66 0F 70), PSHUFHW/PSHUFLW (F3/F2 0F 70)
+                case 0x70:
+                    DecodeModRM(inst, ref pos);
+                    inst.Immediate = _memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    break;
+
+                // MOVQ xmm, xmm/m64 (F3 0F 7E) — already covered by 0x7E
+                // MOVHPS/MOVLPS (0F 12/13/16/17)
+                case 0x12: case 0x13: case 0x16: case 0x17:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // ADDPS/SUBPS/MULPS/DIVPS etc. (0F 58-5F)
+                case 0x58: case 0x59: case 0x5A: case 0x5B:
+                case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // CMPPS/CMPPD (0F C2) with imm8
+                case 0xC2:
+                    DecodeModRM(inst, ref pos);
+                    inst.Immediate = _memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    break;
+
+                // SHUFPS/SHUFPD (0F C6) with imm8
+                case 0xC6:
+                    DecodeModRM(inst, ref pos);
+                    inst.Immediate = _memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    break;
+
+                // PAND/POR/PANDN/PXOR (0F DB/EB/DF/EF)
+                case 0xDB: case 0xEB: case 0xDF:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PADDB-PADDQ, PSUBB-PSUBQ (0F FC-FE, 0F D4, 0F F8-FA)
+                case 0xD4: case 0xF8: case 0xF9: case 0xFA:
+                case 0xFC: case 0xFD: case 0xFE:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PMULLW/PMULHW (0F D5/E5)
+                case 0xD5: case 0xE5:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // PSRLW/PSRLD/PSRLQ/PSRAW/PSRAD/PSLLW/PSLLD/PSLLQ (0F 71-73 with /reg and imm8)
+                case 0x71: case 0x72: case 0x73:
+                    DecodeModRM(inst, ref pos);
+                    inst.Immediate = _memory.ReadByte(pos);
+                    inst.ImmediateSize = 1;
+                    pos += 1;
+                    break;
+
+                // MOVNTDQ/MOVNTI/MOVNTPS (0F C3/E7/2B)
+                case 0x2B: case 0xC3: case 0xE7:
+                    DecodeModRM(inst, ref pos);
+                    break;
+
+                // LFENCE (0F AE /5), MFENCE (/6), SFENCE (/7) — memory fences
+                case 0xAE:
+                    DecodeModRM(inst, ref pos);
+                    break;
 
                 default:
                     break;

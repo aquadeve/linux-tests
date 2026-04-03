@@ -105,9 +105,24 @@ namespace LinuxBinaryTranslator
                 {
                     while (!_cpu.Halted && !cancellationToken.IsCancellationRequested)
                     {
+                        // Check for pending signals at safe points
+                        if (_syscallHandler.DeliverPendingSignal(_cpu, _memory))
+                        {
+                            // Signal handler was set up — continue execution at new RIP
+                            if (_cpu.Halted) break;
+                            continue;
+                        }
+
                         if (!_memory.IsMapped(_cpu.RIP))
                         {
+                            // Try to deliver SIGSEGV before terminating
                             _logger($"Execution fault: RIP=0x{_cpu.RIP:X16} is not in mapped memory");
+                            _syscallHandler.QueueSignal(11); // SIGSEGV
+                            if (_syscallHandler.DeliverPendingSignal(_cpu, _memory))
+                            {
+                                if (_cpu.Halted) break;
+                                continue; // Handler was set up
+                            }
                             _cpu.Halted = true;
                             _cpu.ExitCode = 139; // SIGSEGV
                             break;

@@ -77,6 +77,16 @@ namespace LinuxBinaryTranslator.Cpu
         public ulong FSBase;
         public ulong GSBase;
 
+        // SSE/SSE2 XMM registers (128-bit, stored as two 64-bit halves)
+        // XMM0-XMM15 are required by the AMD64 ABI for floating-point
+        // and are commonly used even in simple static binaries.
+        // We store them as ulong pairs: [low, high] per register.
+        public ulong[] XmmLow = new ulong[16];
+        public ulong[] XmmHigh = new ulong[16];
+
+        // MXCSR — SSE control/status register (default value per AMD64 ABI)
+        public uint MXCSR = 0x1F80; // Default: all exceptions masked, round-to-nearest
+
         /// <summary>
         /// Indicates that the process has called exit/exit_group.
         /// </summary>

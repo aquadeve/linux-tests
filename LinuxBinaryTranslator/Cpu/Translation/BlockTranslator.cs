@@ -136,6 +136,15 @@ namespace LinuxBinaryTranslator.Cpu
 
             byte opcode = inst.Opcode[0];
 
+            // === REP/REPNE prefix handling for string instructions ===
+            // REP (F3): Repeat while RCX != 0 (MOVS, STOS, LODS, INS, OUTS)
+            // REPE (F3): Repeat while RCX != 0 && ZF=1 (CMPS, SCAS)
+            // REPNE (F2): Repeat while RCX != 0 && ZF=0 (CMPS, SCAS)
+            if ((inst.HasRepPrefix || inst.HasRepnePrefix) && IsStringOpcode(opcode))
+            {
+                return ExecuteRepStringOp(inst, opcode, state, mem, nextAddr);
+            }
+
             // Two-byte opcodes
             if (opcode == 0x0F && inst.Opcode.Length > 1)
             {
@@ -143,6 +152,60 @@ namespace LinuxBinaryTranslator.Cpu
             }
 
             return ExecuteOneByteInstruction(inst, opcode, state, mem, nextAddr);
+        }
+
+        /// <summary>
+        /// Returns true if the opcode is a string instruction that can be REP-prefixed.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsStringOpcode(byte opcode)
+        {
+            return opcode == 0xA4 || opcode == 0xA5   // MOVSB / MOVSD/MOVSQ
+                || opcode == 0xAA || opcode == 0xAB   // STOSB / STOSD/STOSQ
+                || opcode == 0xAC || opcode == 0xAD   // LODSB / LODSD/LODSQ
+                || opcode == 0xA6 || opcode == 0xA7   // CMPSB / CMPSD/CMPSQ
+                || opcode == 0xAE || opcode == 0xAF;  // SCASB / SCASD/SCASQ
+        }
+
+        /// <summary>
+        /// Execute a string operation with REP/REPE/REPNE prefix.
+        /// Loops based on RCX counter and (for CMPS/SCAS) the Zero Flag.
+        /// This is critical for memcpy, memset, strlen and similar patterns
+        /// used in static C library code.
+        /// </summary>
+        private ulong ExecuteRepStringOp(DecodedInstruction inst, byte opcode, CpuState state, VirtualMemoryManager mem, ulong nextAddr)
+        {
+            // CMPS and SCAS check ZF for REPE/REPNE termination
+            bool isCmpsOrScas = opcode == 0xA6 || opcode == 0xA7 || opcode == 0xAE || opcode == 0xAF;
+
+            // Safety limit to prevent infinite loops from buggy binaries
+            const int MaxIterations = 0x10000000; // 256M iterations max
+
+            for (int iter = 0; iter < MaxIterations; iter++)
+            {
+                // Check RCX first — if 0, done before executing
+                if (state.RCX == 0)
+                    break;
+
+                // Decrement RCX
+                state.RCX--;
+
+                // Execute one iteration of the string operation
+                ExecuteOneByteInstruction(inst, opcode, state, mem, nextAddr);
+
+                // For CMPS/SCAS with REPE (F3): stop if ZF=0
+                // For CMPS/SCAS with REPNE (F2): stop if ZF=1
+                if (isCmpsOrScas)
+                {
+                    bool zf = state.GetFlag(X86Flags.ZF);
+                    if (inst.HasRepPrefix && !zf)   // REPE: stop when not equal
+                        break;
+                    if (inst.HasRepnePrefix && zf)   // REPNE: stop when equal
+                        break;
+                }
+            }
+
+            return 0; // Continue sequential execution
         }
 
         private ulong ExecuteOneByteInstruction(DecodedInstruction inst, byte opcode, CpuState state, VirtualMemoryManager mem, ulong nextAddr)
@@ -881,13 +944,27 @@ namespace LinuxBinaryTranslator.Cpu
                     else src = inst.RexW ? mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr)) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
                     if (inst.RexW)
                     {
-                        long result = (long)state.GetGpr(inst.Reg) * (long)src;
+                        long a = (long)state.GetGpr(inst.Reg);
+                        long b = (long)src;
+                        long result = a * b;
                         state.SetGpr(inst.Reg, (ulong)result);
+                        // CF=OF=1 if result doesn't fit in 64 bits (i.e., high 64 bits are not sign extension)
+                        UInt128Multiply((ulong)a, (ulong)b, out _, out ulong hi);
+                        bool overflow = (result >= 0) ? (hi != 0) : (hi != 0xFFFFFFFFFFFFFFFFUL);
+                        state.SetFlag(X86Flags.CF, overflow);
+                        state.SetFlag(X86Flags.OF, overflow);
                     }
                     else
                     {
-                        int result = (int)state.GetGpr(inst.Reg) * (int)src;
+                        long a = (int)(uint)state.GetGpr(inst.Reg);
+                        long b = (int)(uint)src;
+                        long result64 = a * b;
+                        int result = (int)result64;
                         state.SetGpr32(inst.Reg, (uint)result);
+                        // CF=OF=1 if result doesn't fit in 32 bits
+                        bool overflow = result64 != (long)result;
+                        state.SetFlag(X86Flags.CF, overflow);
+                        state.SetFlag(X86Flags.OF, overflow);
                     }
                     return 0;
                 }
@@ -1173,12 +1250,202 @@ namespace LinuxBinaryTranslator.Cpu
                     return 0;
                 }
 
+                // === SSE/SSE2 instruction execution ===
+                // Basic support for common SSE instructions found even in non-FP
+                // static binaries (memory init, zeroing, copying patterns).
+
+                // XORPS xmm, xmm/m128 (0F 57) — commonly used to zero an XMM register
+                case 0x57:
+                {
+                    int dstReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        int srcReg = inst.RM;
+                        if (srcReg == dstReg)
+                        {
+                            // XORPS xmm, xmm (same reg) = zero register
+                            state.XmmLow[dstReg] = 0;
+                            state.XmmHigh[dstReg] = 0;
+                        }
+                        else
+                        {
+                            state.XmmLow[dstReg] ^= state.XmmLow[srcReg];
+                            state.XmmHigh[dstReg] ^= state.XmmHigh[srcReg];
+                        }
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        state.XmmLow[dstReg] ^= mem.ReadUInt64(addr);
+                        state.XmmHigh[dstReg] ^= mem.ReadUInt64(addr + 8);
+                    }
+                    return 0;
+                }
+
+                // PXOR xmm, xmm/m128 (66 0F EF) — same as XORPS for integer
+                case 0xEF:
+                {
+                    int dstReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        int srcReg = inst.RM;
+                        if (srcReg == dstReg)
+                        {
+                            state.XmmLow[dstReg] = 0;
+                            state.XmmHigh[dstReg] = 0;
+                        }
+                        else
+                        {
+                            state.XmmLow[dstReg] ^= state.XmmLow[srcReg];
+                            state.XmmHigh[dstReg] ^= state.XmmHigh[srcReg];
+                        }
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        state.XmmLow[dstReg] ^= mem.ReadUInt64(addr);
+                        state.XmmHigh[dstReg] ^= mem.ReadUInt64(addr + 8);
+                    }
+                    return 0;
+                }
+
+                // MOVAPS/MOVUPS xmm, xmm/m128 (0F 28 / 0F 10) — load
+                case 0x28: case 0x10:
+                {
+                    int dstReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        state.XmmLow[dstReg] = state.XmmLow[inst.RM];
+                        state.XmmHigh[dstReg] = state.XmmHigh[inst.RM];
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        state.XmmLow[dstReg] = mem.ReadUInt64(addr);
+                        state.XmmHigh[dstReg] = mem.ReadUInt64(addr + 8);
+                    }
+                    return 0;
+                }
+
+                // MOVAPS/MOVUPS xmm/m128, xmm (0F 29 / 0F 11) — store
+                case 0x29: case 0x11:
+                {
+                    int srcReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        state.XmmLow[inst.RM] = state.XmmLow[srcReg];
+                        state.XmmHigh[inst.RM] = state.XmmHigh[srcReg];
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        mem.WriteUInt64(addr, state.XmmLow[srcReg]);
+                        mem.WriteUInt64(addr + 8, state.XmmHigh[srcReg]);
+                    }
+                    return 0;
+                }
+
+                // MOVDQA/MOVDQU xmm, xmm/m128 (66 0F 6F) — load
+                case 0x6F:
+                {
+                    int dstReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        state.XmmLow[dstReg] = state.XmmLow[inst.RM];
+                        state.XmmHigh[dstReg] = state.XmmHigh[inst.RM];
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        state.XmmLow[dstReg] = mem.ReadUInt64(addr);
+                        state.XmmHigh[dstReg] = mem.ReadUInt64(addr + 8);
+                    }
+                    return 0;
+                }
+
+                // MOVDQA/MOVDQU xmm/m128, xmm (66 0F 7F) — store
+                case 0x7F:
+                {
+                    int srcReg = inst.Reg;
+                    if (inst.Mod == 3)
+                    {
+                        state.XmmLow[inst.RM] = state.XmmLow[srcReg];
+                        state.XmmHigh[inst.RM] = state.XmmHigh[srcReg];
+                    }
+                    else
+                    {
+                        ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                        mem.WriteUInt64(addr, state.XmmLow[srcReg]);
+                        mem.WriteUInt64(addr + 8, state.XmmHigh[srcReg]);
+                    }
+                    return 0;
+                }
+
+                // MOVD xmm, r/m32 or MOVQ xmm, r/m64 (66 0F 6E) — GPR to XMM
+                case 0x6E:
+                {
+                    int dstReg = inst.Reg;
+                    if (inst.RexW)
+                    {
+                        ulong val = inst.Mod == 3 ? state.GetGpr(inst.RM) : mem.ReadUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                        state.XmmLow[dstReg] = val;
+                        state.XmmHigh[dstReg] = 0;
+                    }
+                    else
+                    {
+                        uint val = inst.Mod == 3 ? (uint)state.GetGpr(inst.RM) : mem.ReadUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr));
+                        state.XmmLow[dstReg] = val;
+                        state.XmmHigh[dstReg] = 0;
+                    }
+                    return 0;
+                }
+
+                // MOVD r/m32, xmm or MOVQ r/m64, xmm (66 0F 7E) — XMM to GPR
+                case 0x7E:
+                {
+                    int srcReg = inst.Reg;
+                    if (inst.RexW)
+                    {
+                        if (inst.Mod == 3)
+                            state.SetGpr(inst.RM, state.XmmLow[srcReg]);
+                        else
+                            mem.WriteUInt64(ComputeEffectiveAddress(inst, state, mem, nextAddr), state.XmmLow[srcReg]);
+                    }
+                    else
+                    {
+                        if (inst.Mod == 3)
+                            state.SetGpr32(inst.RM, (uint)state.XmmLow[srcReg]);
+                        else
+                            mem.WriteUInt32(ComputeEffectiveAddress(inst, state, mem, nextAddr), (uint)state.XmmLow[srcReg]);
+                    }
+                    return 0;
+                }
+
+                // MOVNTDQ/MOVNTI/MOVNTPS (0F 2B/C3/E7) — non-temporal store (same as regular store for us)
+                case 0x2B: case 0xE7:
+                {
+                    int srcReg = inst.Reg;
+                    ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                    mem.WriteUInt64(addr, state.XmmLow[srcReg]);
+                    mem.WriteUInt64(addr + 8, state.XmmHigh[srcReg]);
+                    return 0;
+                }
+                case 0xC3: // MOVNTI m32/64, r32/64 — non-temporal store from GPR
+                {
+                    ulong addr = ComputeEffectiveAddress(inst, state, mem, nextAddr);
+                    if (inst.RexW)
+                        mem.WriteUInt64(addr, state.GetGpr(inst.Reg));
+                    else
+                        mem.WriteUInt32(addr, (uint)state.GetGpr(inst.Reg));
+                    return 0;
+                }
+
+                // LFENCE/MFENCE/SFENCE (0F AE /5-7) — memory fences (no-op in single-threaded)
+                case 0xAE:
+                    return 0;
+
                 default:
                     return 0;
-            }
-        }
-
-        // === ALU helpers ===
 
         private ulong ExecuteAluRmR(DecodedInstruction inst, byte opcode, CpuState state, VirtualMemoryManager mem, ulong nextAddr, bool byte_op)
         {

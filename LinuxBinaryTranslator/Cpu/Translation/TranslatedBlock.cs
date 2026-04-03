@@ -70,6 +70,12 @@ namespace LinuxBinaryTranslator.Cpu.Translation
         public bool RexX { get; set; }   // SIB index extension
         public bool RexB { get; set; }   // ModRM r/m or SIB base extension
 
+        // Legacy prefix tracking (needed for REP string ops and operand size)
+        public bool HasRepPrefix { get; set; }      // F3 — REP/REPE prefix
+        public bool HasRepnePrefix { get; set; }    // F2 — REPNE/REPNZ prefix
+        public bool HasOperandOverride { get; set; } // 66 — operand size override
+        public bool HasAddressOverride { get; set; } // 67 — address size override
+
         public byte[] Opcode { get; set; } = Array.Empty<byte>();
         public byte ModRM { get; set; }
         public bool HasModRM { get; set; }

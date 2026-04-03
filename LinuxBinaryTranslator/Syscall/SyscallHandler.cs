@@ -179,8 +179,108 @@ namespace LinuxBinaryTranslator.Syscall
         // Working directory
         private string _cwd = "/";
 
-        // Signal handling (stub — just track registered handlers)
+        // Signal handling — tracks registered handlers and pending signals
         private readonly long[] _signalHandlers = new long[65];
+        private readonly ulong[] _signalFlags = new ulong[65];    // sa_flags per signal
+        private readonly ulong[] _signalMasks = new ulong[65];    // sa_mask per signal
+        private ulong _signalProcMask;                             // Process signal mask (blocked signals)
+        private readonly bool[] _pendingSignals = new bool[65];    // Pending signal delivery queue
+
+        // Signal handler special values from kernel include/uapi/asm-generic/signal-defs.h
+        private const long SIG_DFL = 0;
+        private const long SIG_IGN = 1;
+
+        /// <summary>
+        /// Queue a signal for delivery at the next safe point.
+        /// Called by the execution engine when a fault occurs (e.g., SIGSEGV).
+        /// </summary>
+        public void QueueSignal(int signum)
+        {
+            if (signum < 1 || signum > 64) return;
+            _pendingSignals[signum] = true;
+        }
+
+        /// <summary>
+        /// Check for pending signals and deliver them by invoking the registered
+        /// handler. Returns true if a signal was delivered and the handler address
+        /// was set up for execution, false if no signals pending.
+        /// </summary>
+        public bool DeliverPendingSignal(CpuState state, VirtualMemoryManager memory)
+        {
+            for (int sig = 1; sig <= 64; sig++)
+            {
+                if (!_pendingSignals[sig]) continue;
+
+                // Check if signal is blocked
+                if ((_signalProcMask & (1UL << (sig - 1))) != 0) continue;
+
+                _pendingSignals[sig] = false;
+
+                long handler = _signalHandlers[sig];
+
+                // SIG_IGN — ignore signal
+                if (handler == SIG_IGN)
+                    continue;
+
+                // SIG_DFL — default action
+                if (handler == SIG_DFL)
+                {
+                    // Default action for most signals is terminate
+                    switch (sig)
+                    {
+                        case Signals.SIGCHLD:
+                        case Signals.SIGURG:
+                        case Signals.SIGWINCH:
+                            continue; // Default: ignore
+
+                        case Signals.SIGSTOP:
+                        case Signals.SIGTSTP:
+                        case Signals.SIGTTIN:
+                        case Signals.SIGTTOU:
+                            continue; // Default: stop (we just ignore)
+
+                        case Signals.SIGCONT:
+                            continue; // Default: continue (no-op)
+
+                        default:
+                            // Default: terminate process
+                            _logger($"Signal {sig}: default action — terminate");
+                            state.Halted = true;
+                            state.ExitCode = 128 + sig; // Convention: exit code = 128+signum
+                            return true;
+                    }
+                }
+
+                // User-defined handler — set up the signal frame on the stack
+                // This follows the Linux kernel's signal delivery convention:
+                //   1. Save current state (RIP, registers) on the signal stack
+                //   2. Set RIP to the handler address
+                //   3. Set RDI to the signal number (first argument)
+                //   4. When the handler returns, it should call rt_sigreturn
+                //
+                // Simplified: we push the current RIP as return address and
+                // jump to the handler. The handler will execute and eventually
+                // call sigreturn or just return.
+
+                ulong savedRip = state.RIP;
+
+                // Push signal frame: saved RIP for sigreturn
+                state.RSP -= 8;
+                memory.WriteUInt64(state.RSP, savedRip);
+
+                // Set up handler invocation per x86_64 ABI
+                state.RIP = (ulong)handler;
+                state.RDI = (ulong)sig;  // Signal number as first argument
+
+                // Block signals from the sa_mask during handler execution
+                _signalProcMask |= _signalMasks[sig];
+
+                _logger($"Delivering signal {sig} to handler 0x{handler:X}");
+                return true;
+            }
+
+            return false;
+        }
 
         public SyscallHandler(VirtualMemoryManager memory, VirtualFileSystem vfs, Action<string>? logger = null)
         {
@@ -252,7 +352,7 @@ namespace LinuxBinaryTranslator.Syscall
                     SyscallNumber.SYS_newfstatat => SysNewfstatat((int)arg1, arg2, arg3, (int)arg4),
                     SyscallNumber.SYS_faccessat => SysFaccessat((int)arg1, arg2, (int)arg3),
                     SyscallNumber.SYS_rt_sigaction => SysRtSigaction((int)arg1, arg2, arg3, arg4),
-                    SyscallNumber.SYS_rt_sigprocmask => 0, // Stub: signal mask management
+                    SyscallNumber.SYS_rt_sigprocmask => SysRtSigprocmask((int)arg1, arg2, arg3, arg4),
                     SyscallNumber.SYS_sigaltstack => 0, // Stub
                     SyscallNumber.SYS_arch_prctl => SysArchPrctl(state, (int)arg1, arg2),
                     SyscallNumber.SYS_set_tid_address => _pid,
@@ -643,14 +743,51 @@ namespace LinuxBinaryTranslator.Syscall
             if (oldact != 0)
             {
                 _memory.WriteUInt64(oldact, (ulong)_signalHandlers[sig]);
-                _memory.WriteUInt64(oldact + 8, 0); // sa_flags
-                _memory.WriteUInt64(oldact + 16, 0); // sa_restorer
-                _memory.WriteUInt64(oldact + 24, 0); // sa_mask
+                _memory.WriteUInt64(oldact + 8, _signalFlags[sig]);       // sa_flags
+                _memory.WriteUInt64(oldact + 16, 0);                       // sa_restorer
+                _memory.WriteUInt64(oldact + 24, _signalMasks[sig]);      // sa_mask
             }
 
             if (act != 0)
             {
                 _signalHandlers[sig] = (long)_memory.ReadUInt64(act);
+                _signalFlags[sig] = _memory.ReadUInt64(act + 8);    // sa_flags
+                // Skip sa_restorer at +16
+                _signalMasks[sig] = _memory.ReadUInt64(act + 24);   // sa_mask
+            }
+
+            return 0;
+        }
+
+        private long SysRtSigprocmask(int how, ulong setAddr, ulong oldsetAddr, ulong sigsetsize)
+        {
+            // Save old mask if requested
+            if (oldsetAddr != 0)
+            {
+                _memory.WriteUInt64(oldsetAddr, _signalProcMask);
+            }
+
+            // Update mask if new mask provided
+            if (setAddr != 0)
+            {
+                ulong newSet = _memory.ReadUInt64(setAddr);
+                // Can't block SIGKILL or SIGSTOP
+                newSet &= ~((1UL << (Signals.SIGKILL - 1)) | (1UL << (Signals.SIGSTOP - 1)));
+
+                switch (how)
+                {
+                    case 0: // SIG_BLOCK
+                        _signalProcMask |= newSet;
+                        break;
+                    case 1: // SIG_UNBLOCK
+                        _signalProcMask &= ~newSet;
+                        break;
+                    case 2: // SIG_SETMASK
+                        _signalProcMask = newSet;
+                        break;
+                    default:
+                        return -Errno.EINVAL;
+                }
             }
 
             return 0;
